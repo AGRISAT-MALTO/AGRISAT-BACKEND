@@ -20,6 +20,8 @@ import {
 
 import { fetchSentinel2TilePng } from "./sentinel-tiles.js";
 
+import { computeZoning } from "./zoning.js";
+
 import { callFieldSegmentationModel } from "./field-segmentation.js";
 
 import planetRoutes from "./routes/planet.routes.js";
@@ -663,6 +665,29 @@ app.post(
       .send(
         await response.text()
       );
+  }
+);
+
+
+// ============================================================
+// ZONING (VRA)
+// ============================================================
+
+app.post(
+  "/api/zoning-parcel",
+  async (request, reply) => {
+    const response = await computeZoning(
+      new Request("http://backend/zoning-parcel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request.body),
+      })
+    );
+
+    return reply
+      .code(response.status)
+      .headers(Object.fromEntries(response.headers.entries()))
+      .send(await response.text());
   }
 );
 

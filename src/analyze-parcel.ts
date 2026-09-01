@@ -460,7 +460,7 @@ export function geeImageConstant(value: number): GeeValue {
   return geeCall("Image.constant", { value: geeConstant(value) });
 }
 
-function normalizePolygon(value: unknown): LatLng[] | null {
+export function normalizePolygon(value: unknown): LatLng[] | null {
   if (!Array.isArray(value)) return null;
   const points = value.flatMap((point): LatLng[] => {
     if (!point || typeof point !== "object") return [];
@@ -482,7 +482,7 @@ function normalizePolygon(value: unknown): LatLng[] | null {
   return last && first.lat === last.lat && first.lng === last.lng ? points.slice(0, -1) : points;
 }
 
-function polygonCoordinates(polygon: unknown): number[][][] {
+export function polygonCoordinates(polygon: unknown): number[][][] {
   const points = normalizePolygon(polygon);
   if (!points) throw new Error("Le contour de la parcelle est invalide.");
   const ring = points.map((point) => [point.lng, point.lat]);
