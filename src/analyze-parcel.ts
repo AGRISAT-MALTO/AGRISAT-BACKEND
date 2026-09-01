@@ -56,9 +56,10 @@ export async function analyzeParcel(req: Request): Promise<Response> {
       }
     }
 
-    const [snapshotResult, timeSeriesResult] = await Promise.allSettled([
+    const [snapshotResult, timeSeriesResult, rainResult] = await Promise.allSettled([
       accessToken ? fetchCurrentSnapshot(accessToken, lat, lng, projectId, parcelPolygon) : Promise.resolve(null),
       accessToken ? fetchTimeSeries(accessToken, lat, lng, projectId, parcelPolygon) : Promise.resolve(null),
+      fetchPrecipitationTimeSeries(lat, lng, getMonthlyRanges(6)),
     ]);
     const satData = snapshotResult.status === "fulfilled" && snapshotResult.value
       ? snapshotResult.value
@@ -66,8 +67,10 @@ export async function analyzeParcel(req: Request): Promise<Response> {
     const timeSeries = timeSeriesResult.status === "fulfilled" && timeSeriesResult.value
       ? timeSeriesResult.value
       : { s2: [], s1: [] };
+    const timeSeriesRain = rainResult.status === "fulfilled" ? rainResult.value : [];
     if (snapshotResult.status === "rejected") warnings.push(`Sentinel-2 indisponible : ${getErrorMessage(snapshotResult.reason)}`);
     if (timeSeriesResult.status === "rejected") warnings.push(`Séries temporelles indisponibles : ${getErrorMessage(timeSeriesResult.reason)}`);
+    if (rainResult.status === "rejected") warnings.push(`Précipitations indisponibles : ${getErrorMessage(rainResult.reason)}`);
 
     const detectedSegments = accessToken
       ? await detectBarleySegments(accessToken, projectId, lat, lng, parcelPolygon, effectiveZoom, warnings)
@@ -136,7 +139,7 @@ export async function analyzeParcel(req: Request): Promise<Response> {
       anomaly_level: hybrid.final_is_barley ? "AUCUNE" : "FORTE", data_source: dataSource,
       warnings,
       radar_analysis: radarAnalysis, spectral_analysis: spectralAnalysis,
-      time_series_s2: timeSeries.s2, time_series_s1: timeSeries.s1,
+      time_series_s2: timeSeries.s2, time_series_s1: timeSeries.s1, time_series_rain: timeSeriesRain,
       estimated_planting_date: planting.estimated_planting_date,
       estimated_harvest_date: planting.estimated_harvest_date,
       days_since_planting: planting.days_since_planting, growth_stage: planting.growth_stage,
@@ -1015,6 +1018,7 @@ async function fetchCurrentSnapshot(accessToken: string, lat: number, lng: numbe
 
 interface TimeSeriesPointS2 { date: string; ndvi: number | null; cloud_cover: number | null; }
 interface TimeSeriesPointS1 { date: string; vv: number | null; vh: number | null; }
+interface TimeSeriesPointRain { date: string; precipitation_mm: number | null; }
 
 function getMonthlyRanges(numMonths: number): Array<{ label: string; start: string; end: string }> {
   const now = new Date();
@@ -1059,6 +1063,58 @@ async function fetchTimeSeries(
   });
 
   return { s2, s1 };
+}
+
+/**
+ * Précipitations réelles (Open-Meteo, historique gratuit sans clé) agrégées par mois pour
+ * s'aligner sur les mêmes libellés que `time_series_s2`/`time_series_s1` (ex. "2026-03").
+ */
+async function fetchPrecipitationTimeSeries(
+  lat: number, lng: number, months: Array<{ label: string; start: string; end: string }>
+): Promise<TimeSeriesPointRain[]> {
+  if (months.length === 0) return [];
+
+  const archiveCutoff = new Date();
+  archiveCutoff.setUTCDate(archiveCutoff.getUTCDate() - 2);
+  const cutoffStr = archiveCutoff.toISOString().slice(0, 10);
+  const startDate = months[0].start;
+  const lastMonthEnd = months[months.length - 1].end;
+  const endDate = lastMonthEnd > cutoffStr ? cutoffStr : lastMonthEnd;
+
+  const url = new URL("https://archive-api.open-meteo.com/v1/archive");
+  url.search = new URLSearchParams({
+    latitude: String(lat),
+    longitude: String(lng),
+    start_date: startDate,
+    end_date: endDate,
+    daily: "precipitation_sum",
+    timezone: "auto",
+  }).toString();
+
+  const response = await fetchWithRetry(url, {}, EXTERNAL_REQUEST_TIMEOUT_MS);
+  if (!response.ok) throw new Error("Les données de précipitations Open-Meteo sont indisponibles.");
+  const payload: unknown = await response.json();
+  const daily = payload && typeof payload === "object" && "daily" in payload ? (payload as { daily: unknown }).daily : null;
+  if (!daily || typeof daily !== "object") throw new Error("Réponse météo (pluie) incomplète.");
+  const values = daily as { time?: unknown; precipitation_sum?: unknown };
+  if (!Array.isArray(values.time) || !Array.isArray(values.precipitation_sum)) {
+    throw new Error("Précipitations journalières indisponibles.");
+  }
+  const dates = values.time as unknown[];
+  const precipValues = values.precipitation_sum as unknown[];
+
+  const monthlyTotals = new Map<string, number>();
+  dates.forEach((date, index) => {
+    const value = precipValues[index];
+    if (typeof date !== "string" || typeof value !== "number") return;
+    const monthLabel = date.slice(0, 7);
+    monthlyTotals.set(monthLabel, (monthlyTotals.get(monthLabel) ?? 0) + value);
+  });
+
+  return months.map((m) => ({
+    date: m.label,
+    precipitation_mm: monthlyTotals.has(m.label) ? Math.round((monthlyTotals.get(m.label) as number) * 10) / 10 : null,
+  }));
 }
 
 async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T) => Promise<R>): Promise<R[]> {

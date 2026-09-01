@@ -31,6 +31,7 @@ model Parcelle {
   notes                    String?
   time_series_s1           Json?
   time_series_s2           Json?
+  time_series_rain         Json?
   estimated_planting_date  String?
   estimated_harvest_date   String?
   days_since_planting     Int?
