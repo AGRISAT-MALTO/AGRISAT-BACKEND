@@ -718,37 +718,46 @@ export async function detectAutomaticParcels({ lat, lng, radiusKm, baseTemperatu
 
 async function discoverAgriculturalParcels(lat: number, lng: number, radiusKm: number): Promise<CandidateParcel[]> {
   // Overpass et la base sont indépendants l'un de l'autre : les lancer en parallèle
-  // (plutôt qu'en séquence) coupe le pire cas cumulé en deux, sans changer l'ordre de
-  // priorité — Overpass reste préféré à la base si les deux ont trouvé quelque chose.
-  const [candidates, databaseCandidates] = await Promise.all([
+  // (plutôt qu'en séquence) coupe le pire cas cumulé en deux.
+  const [osmCandidates, databaseCandidates] = await Promise.all([
     discoverAgriculturalParcelsFromOverpass(lat, lng, radiusKm),
     discoverAgriculturalParcelsFromDatabase(lat, lng, radiusKm),
   ]);
-  if (candidates.length > 0) return ensureCoordinateCoverage(candidates, lat, lng, radiusKm);
-  if (databaseCandidates.length > 0) return ensureCoordinateCoverage(databaseCandidates, lat, lng, radiusKm);
+  // On garde les deux sources (au lieu de renvoyer la première non vide) : un unique
+  // contour connu (OSM ou base) ne doit pas empêcher de tracer les autres champs de la
+  // même zone avec les modèles de segmentation ci-dessous — sinon une seule parcelle déjà
+  // enregistrée suffit à couvrir tout le reste du rayon de cellules satellite sans forme.
+  const knownCandidates = deduplicateByCenter([...osmCandidates, ...databaseCandidates]);
 
+  if (knownCoverageRatio(knownCandidates, lat, lng, radiusKm) >= MIN_KNOWN_COVERAGE_RATIO) {
+    return ensureCoordinateCoverage(knownCandidates, lat, lng, radiusKm);
+  }
+
+  let tracedCandidates: CandidateParcel[] = [];
   try {
-    const fieldModelCandidates = await discoverAgriculturalParcelsFromFieldModel(lat, lng, radiusKm);
-    if (fieldModelCandidates.length > 0) return ensureCoordinateCoverage(fieldModelCandidates, lat, lng, radiusKm);
+    tracedCandidates = await discoverAgriculturalParcelsFromFieldModel(lat, lng, radiusKm);
   } catch (error) {
     console.warn("discoverAgriculturalParcelsFromFieldModel failed, trying next fallback:", error);
   }
 
-  try {
-    const watershedCandidates = await discoverAgriculturalParcelsFromWatershed(lat, lng, radiusKm);
-    if (watershedCandidates.length > 0) return ensureCoordinateCoverage(watershedCandidates, lat, lng, radiusKm);
-  } catch (error) {
-    console.warn("discoverAgriculturalParcelsFromWatershed failed, trying next fallback:", error);
+  if (tracedCandidates.length === 0) {
+    try {
+      tracedCandidates = await discoverAgriculturalParcelsFromWatershed(lat, lng, radiusKm);
+    } catch (error) {
+      console.warn("discoverAgriculturalParcelsFromWatershed failed, trying next fallback:", error);
+    }
   }
 
-  try {
-    const geeSegmentedCandidates = await discoverAgriculturalParcelsFromGeeSegmentation(lat, lng, radiusKm);
-    if (geeSegmentedCandidates.length > 0) return ensureCoordinateCoverage(geeSegmentedCandidates, lat, lng, radiusKm);
-  } catch (error) {
-    console.warn("discoverAgriculturalParcelsFromGeeSegmentation failed, trying next fallback:", error);
+  if (tracedCandidates.length === 0) {
+    try {
+      tracedCandidates = await discoverAgriculturalParcelsFromGeeSegmentation(lat, lng, radiusKm);
+    } catch (error) {
+      console.warn("discoverAgriculturalParcelsFromGeeSegmentation failed, trying next fallback:", error);
+    }
   }
 
-  return createSatelliteSearchCellCandidates(lat, lng, radiusKm);
+  const mergedCandidates = deduplicateByCenter([...knownCandidates, ...tracedCandidates]);
+  return ensureCoordinateCoverage(mergedCandidates, lat, lng, radiusKm);
 }
 
 // Distance en dessous de laquelle deux candidats sont considérés comme la même parcelle
@@ -765,6 +774,22 @@ function deduplicateByCenter<T extends { center: { lat: number; lng: number } }>
     if (!isDuplicate) kept.push(candidate);
   }
   return kept;
+}
+
+// En dessous de ce taux (surface cumulée des candidats connus / surface du cercle de
+// recherche), OSM + la base ne couvrent qu'une partie de la zone : on tente alors de
+// tracer les champs restants avec les modèles de segmentation plutôt que de les couvrir
+// avec des cellules satellite sans forme (voir discoverAgriculturalParcels).
+const MIN_KNOWN_COVERAGE_RATIO = 0.6;
+
+function knownCoverageRatio(candidates: CandidateParcel[], lat: number, lng: number, radiusKm: number): number {
+  const circleAreaM2 = Math.PI * (radiusKm * 1_000) ** 2;
+  if (circleAreaM2 <= 0) return 1;
+  const coveredAreaM2 = candidates.reduce((sum, candidate) => {
+    const clipped = clipPolygonToRadius(candidate.coordinates, { lat, lng }, radiusKm);
+    return clipped.length < 3 ? sum : sum + approximatePolygonAreaM2(clipped);
+  }, 0);
+  return coveredAreaM2 / circleAreaM2;
 }
 
 function ensureCoordinateCoverage(candidates: CandidateParcel[], lat: number, lng: number, radiusKm: number): CandidateParcel[] {
