@@ -1343,9 +1343,10 @@ function computeHybridScore(cnnConfidence: number, cnnIsBarley: boolean, agroSco
   // Hybrid = 0.6 * CNN + 0.4 * Agro
   const hybridScore = Math.round(cnnScore * 0.6 + agroScore * 0.4);
 
-  // Disagreement penalty
+  // Disagreement penalty — seuil et poids assouplis pour ne pénaliser que les désaccords
+  // vraiment francs (au lieu de faire basculer en incertain dès qu'un écart modéré existe).
   const disagreement = Math.abs(cnnScore - agroScore);
-  const penalty = disagreement > 40 ? disagreement * 0.15 : 0;
+  const penalty = disagreement > 55 ? disagreement * 0.08 : 0;
   const finalConfidence = Math.max(0, Math.min(100, Math.round(hybridScore - penalty)));
 
   const finalIsBarley = hybridScore > 50;
@@ -1353,15 +1354,15 @@ function computeHybridScore(cnnConfidence: number, cnnIsBarley: boolean, agroSco
   let verdict: string;
   if (finalIsBarley) {
     if (finalConfidence > 80) verdict = "✅ ORGE CONFIRMÉE — CNN + Règles agro concordent";
-    else if (finalConfidence > 60) verdict = "🟡 ORGE PROBABLE — Confiance modérée";
+    else if (finalConfidence > 45) verdict = "🟡 ORGE PROBABLE — Confiance modérée";
     else verdict = "⚠️ ORGE INCERTAIN — Validation terrain recommandée";
   } else {
     if (finalConfidence > 80) verdict = "❌ NON-ORGE CONFIRMÉ — CNN + Agro concordent";
-    else if (finalConfidence > 60) verdict = "🟡 PROBABLEMENT NON-ORGE";
+    else if (finalConfidence > 45) verdict = "🟡 PROBABLEMENT NON-ORGE";
     else verdict = "⚠️ INDÉTERMINÉ — Données insuffisantes";
   }
 
-  if (disagreement > 40) {
+  if (disagreement > 55) {
     verdict += ` (⚠️ désaccord CNN/Agro: ${disagreement.toFixed(0)}%)`;
   }
 
