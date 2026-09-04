@@ -1,6 +1,6 @@
 # AGRISAT — Backend
 
-API du projet AGRISAT : détection automatique de parcelles agricoles, analyse de cultures par imagerie satellite (NDVI/NDRE/EVI/SAVI/NDWI, détection d'orge par CNN) et diffusion de tuiles Sentinel-2/Planet. Serveur Fastify + TypeScript + Prisma (PostgreSQL).
+API du projet AGRISAT : détection automatique de parcelles agricoles, analyse de cultures par imagerie satellite (NDVI/NDRE/EVI/SAVI/NDWI, détection d'orge par CNN) et diffusion de tuiles Sentinel-2/Planet. Serveur FastAPI + Python + SQLAlchemy (PostgreSQL).
 
 > Ce dépôt est le backend du projet [AGRISAT](../README.md). Il est consommé par [AGRISAT-FRONTEND](../AGRISAT-FRONTEND).
 
@@ -13,7 +13,6 @@ API du projet AGRISAT : détection automatique de parcelles agricoles, analyse d
 - [Configuration](#configuration)
 - [Base de données](#base-de-données)
 - [Lancer le projet](#lancer-le-projet)
-- [Scripts disponibles](#scripts-disponibles)
 - [API — endpoints](#api--endpoints)
 - [Structure du projet](#structure-du-projet)
 - [Dépannage](#dépannage)
@@ -22,26 +21,25 @@ API du projet AGRISAT : détection automatique de parcelles agricoles, analyse d
 
 | Domaine          | Technologie                          |
 | ------------------ | --------------------------------------- |
-| Runtime / langage   | Node.js (ESM) + TypeScript              |
-| Serveur HTTP        | [Fastify](https://fastify.dev/) 5       |
-| ORM / base de données | [Prisma](https://www.prisma.io/) + PostgreSQL (compatible [Neon](https://neon.tech/)) |
-| Validation          | [Zod](https://zod.dev/)                  |
-| Imagerie satellite  | Google Earth Engine (GEE), Sentinel-2, Planet, Airbus OneAtlas |
+| Runtime / langage   | Python 3.11+                            |
+| Serveur HTTP        | [FastAPI](https://fastapi.tiangolo.com/) + Uvicorn |
+| ORM / base de données | [SQLAlchemy](https://www.sqlalchemy.org/) (async) + [Alembic](https://alembic.sqlalchemy.org/) + PostgreSQL (compatible [Neon](https://neon.tech/)) |
+| Validation          | [Pydantic](https://docs.pydantic.dev/)   |
+| Imagerie satellite  | Google Earth Engine (GEE, via `google-auth` + API REST), Sentinel-2, Planet, Airbus OneAtlas |
 | Détection IA        | Modèle de segmentation U-Net (service externe FastAPI/Hugging Face) |
 
 ## Architecture
 
 Le backend orchestre plusieurs sources et services externes :
 
-- **Google Earth Engine (GEE)** : indices spectraux (NDVI, NDRE, EVI, SAVI, NDWI), séries temporelles Sentinel-1/2, tuiles Sentinel-2.
+- **Google Earth Engine (GEE)** : indices spectraux (NDVI, NDRE, EVI, SAVI, NDWI), séries temporelles Sentinel-1/2, tuiles Sentinel-2. Accès via l'API REST (`value:compute` / `image:computePixels`), authentifié avec un compte de service via `google-auth`.
 - **Modèle de segmentation de parcelles** (`FIELD_SEGMENTATION_MODEL_URL`) : service externe (ex. `agri_field_segmentation`, FastAPI/U-Net) utilisé pour la délimitation automatique des parcelles et la détection d'orge par CNN.
 - **Airbus OneAtlas** : imagerie haute résolution complémentaire.
-- **PostgreSQL (Prisma)** : persistance des parcelles (`parcelles`) et des exécutions d'analyse (`field_scan_runs`).
+- **PostgreSQL (SQLAlchemy)** : persistance des parcelles (`parcelles`) et des exécutions d'analyse (`field_scan_runs`).
 
 ## Prérequis
 
-- [Node.js](https://nodejs.org/) 18 ou supérieur
-- npm
+- [Python](https://www.python.org/) 3.11 ou supérieur
 - Une base PostgreSQL accessible (ex. [Neon](https://neon.tech/))
 - Un compte de service Google Earth Engine (clé JSON)
 - (Optionnel) Un service de segmentation de parcelles compatible (`FIELD_SEGMENTATION_MODEL_URL`)
@@ -51,7 +49,13 @@ Le backend orchestre plusieurs sources et services externes :
 
 ```bash
 cd AGRISAT-BACKEND
-npm install
+python -m venv .venv
+# Windows :
+.venv\Scripts\activate
+# macOS/Linux :
+source .venv/bin/activate
+
+pip install -e .
 ```
 
 ## Configuration
@@ -66,7 +70,7 @@ cp .env.example .env
 
 | Variable                        | Obligatoire | Description                                                                                          |
 | ---------------------------------- | :---------: | ---------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`                     |   **Oui**   | URL de connexion PostgreSQL (Prisma), ex. Neon : `postgresql://user:password@host/db?sslmode=require`       |
+| `DATABASE_URL`                     |   **Oui**   | URL de connexion PostgreSQL, ex. Neon : `postgresql://user:password@host/db?sslmode=require`       |
 | `GEE_SERVICE_ACCOUNT_KEY`          |   **Oui**   | Clé JSON du compte de service Google Earth Engine (indices spectraux, tuiles Sentinel-2)                     |
 | `HF_MODEL_URL`                     |     Non     | URL du modèle hébergé (Hugging Face Space) utilisé en complément de la détection                            |
 | `FIELD_SEGMENTATION_MODEL_URL`     |     Non     | URL du service de segmentation U-Net (`/predict`, `/segment`). En local : `http://localhost:8000`             |
@@ -83,40 +87,39 @@ cp .env.example .env
 
 ## Base de données
 
-Le schéma est défini avec Prisma dans [`prisma/schema.prisma`](prisma/schema.prisma) (modèles `Parcelle` et `FieldScanRun`), accompagné des scripts SQL [`001_init.sql`](prisma/001_init.sql) et [`002_add_parcelle_location_index.sql`](prisma/002_add_parcelle_location_index.sql).
+Le schéma est défini avec SQLAlchemy dans [`app/models.py`](app/models.py) (modèles `Parcelle`, `FieldScanRun`, et `VhrRefinement` — cette dernière présente en base mais sans code applicatif l'utilisant, conservée pour fidélité de schéma). Les migrations Alembic vivent dans [`migrations/`](migrations).
+
+La base de données de production existe déjà (créée historiquement via `prisma db push`) : la migration [`0001_baseline`](migrations/versions/0001_baseline.py) documente ce schéma pour référence, mais **ne doit être appliquée que via `stamp`**, jamais `upgrade`, pour ne pas tenter de recréer des tables déjà existantes :
 
 ```bash
-# Générer le client Prisma
-npm run prisma:generate
+# Sur une base déjà existante (production) : marque la baseline comme "déjà appliquée"
+alembic stamp head
 
-# Synchroniser le schéma avec la base (db push)
-npm run prisma:push
+# Sur une base neuve (dev vierge) : crée réellement le schéma
+alembic upgrade head
+```
+
+Pour toute évolution de schéma ultérieure, le cycle Alembic normal s'applique :
+
+```bash
+alembic revision --autogenerate -m "description du changement"
+# relire la migration générée avant de l'appliquer
+alembic upgrade head
 ```
 
 ## Lancer le projet
 
 ```bash
-npm run dev
+uvicorn app.main:app --reload --port 3001
 ```
 
-Le serveur démarre par défaut sur [http://localhost:3001](http://localhost:3001) (hot reload via `tsx watch`).
+Le serveur démarre par défaut sur [http://localhost:3001](http://localhost:3001) (hot reload via `--reload`).
 
-### Build de production
+### Lancement en production
 
 ```bash
-npm run build
-npm start
+uvicorn app.main:app --host 0.0.0.0 --port 3001
 ```
-
-## Scripts disponibles
-
-| Commande                  | Description                                          |
-| ---------------------------- | ---------------------------------------------------------- |
-| `npm run dev`                | Démarre le serveur en mode développement (hot reload)       |
-| `npm run build`              | Compile le TypeScript dans `dist/`                           |
-| `npm start`                  | Démarre le serveur compilé (`dist/server.js`)                |
-| `npm run prisma:generate`    | Génère le client Prisma                                      |
-| `npm run prisma:push`        | Applique le schéma Prisma à la base de données                |
 
 ## API — endpoints
 
@@ -125,39 +128,41 @@ npm start
 | `GET`     | `/health`                             | Vérification de l'état du serveur                                        |
 | `GET`     | `/api/planet/status`                  | Vérifie que `PLANET_API_KEY` est configurée                              |
 | `GET`     | `/api/planet/series`                  | Liste les séries/mosaïques Planet disponibles                            |
+| `GET`     | `/api/planet/tiles/:z/:x/:y.png`      | Tuile Planet (proxy)                                                     |
 | `GET`     | `/api/parcelles`                      | Liste les parcelles enregistrées (avec cache court)                      |
 | `POST`    | `/api/parcelles`                      | Crée une parcelle                                                        |
 | `DELETE`  | `/api/parcelles/:id`                  | Supprime une parcelle                                                    |
 | `POST`    | `/api/detect-parcels`                 | Détection automatique de parcelles autour d'un point (avec repli si la base est indisponible) |
 | `POST`    | `/api/detect-parcels-fallback`        | Détection automatique de parcelles (variante sans repli)                 |
 | `POST`    | `/api/analyze-parcel`                 | Analyse détaillée d'une parcelle (indices spectraux, séries temporelles) |
+| `POST`    | `/api/zoning-parcel`                  | Zonage NDVI (VRA, 3 zones) d'une parcelle                                 |
 | `POST`    | `/api/analyze`                        | Analyse simplifiée d'une zone (rayon, seuils de confiance/surface)       |
 | `GET`     | `/api/analyze/latest`                 | Dernière analyse enregistrée pour une position donnée                    |
 | `GET`     | `/api/sentinel-tiles/:z/:x/:y`        | Tuile Sentinel-2 (PNG) pour un timestamp d'image donné                   |
 | `POST`    | `/api/field-segmentation`             | Segmentation d'une image de parcelle via le modèle U-Net externe          |
 
-Toutes les routes retournent du JSON et valident leur entrée avec [Zod](https://zod.dev/) (erreurs `400` avec détails en cas d'échec de validation).
+Toutes les routes retournent du JSON et valident leur entrée avec [Pydantic](https://docs.pydantic.dev/) (erreurs `400` avec détails en cas d'échec de validation).
+
+La documentation interactive OpenAPI est disponible sur `/docs` (Swagger UI) et `/redoc` en développement.
 
 ## Structure du projet
 
 ```
 AGRISAT-BACKEND/
-├── src/
-│   ├── server.ts               # Point d'entrée Fastify, déclaration des routes
-│   ├── analyze-parcel.ts        # Analyse détaillée d'une parcelle (GEE)
-│   ├── automatic-parcels.ts     # Détection automatique de parcelles
-│   ├── barley-detect-simple.ts  # Analyse simplifiée / détection d'orge
-│   ├── field-segmentation.ts    # Appel au modèle de segmentation externe
-│   ├── field-watershed.ts       # Segmentation par ligne de partage des eaux
-│   ├── sentinel-tiles.ts        # Génération des tuiles Sentinel-2
-│   ├── db.ts                     # Client Prisma
-│   ├── routes/                   # Routes additionnelles (Planet)
-│   └── services/                 # Services externes (Planet, ...)
-├── prisma/
-│   ├── schema.prisma             # Schéma de base de données
-│   └── *.sql                      # Scripts de migration
-├── .env.example                  # Modèle des variables d'environnement
-└── tsconfig.json
+├── app/
+│   ├── main.py                   # Point d'entrée FastAPI, CORS, handlers d'erreur, lifespan
+│   ├── config.py                 # Variables d'environnement (pydantic-settings)
+│   ├── db.py                     # Moteur SQLAlchemy async
+│   ├── models.py                 # Modèles SQLAlchemy (Parcelle, FieldScanRun, VhrRefinement)
+│   ├── schemas.py                # Schémas Pydantic (validation des requêtes)
+│   ├── errors.py                 # Gestion d'erreurs centralisée
+│   ├── cache.py                  # Cache TTL des parcelles
+│   ├── routes/                   # Endpoints HTTP
+│   └── services/                 # Logique métier (analyse GEE, watershed, zonage, ...)
+├── migrations/                   # Migrations Alembic
+├── pyproject.toml                # Dépendances Python
+├── alembic.ini
+└── .env.example                  # Modèle des variables d'environnement
 ```
 
 ## Dépannage

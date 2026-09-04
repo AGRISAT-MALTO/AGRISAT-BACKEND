@@ -1,13 +1,6 @@
-node_modules/
-dist/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
 .env
 *.log
-
-# Scripts de debug ponctuels, non liés à l'application
-check_env.js
-check_env.mjs
-check_prisma.js
-check_prisma.mjs
-tmp_check_env.js
-tmp_check_env.mjs
-backend_gee_token_test.mjs
