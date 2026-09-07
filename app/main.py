@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import cache
 from app.config import settings
 from app.errors import register_error_handlers
-from app.routes import api_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agrisat")
@@ -39,6 +38,9 @@ app.add_middleware(
 )
 
 register_error_handlers(app)
+
+from app.routes import api_router  # noqa: E402 — après la config CORS/erreurs, avant le montage
+
 app.include_router(api_router)
 
 

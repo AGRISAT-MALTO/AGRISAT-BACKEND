@@ -992,12 +992,15 @@ def compute_hybrid_score(cnn_confidence: float, cnn_is_barley: bool, agro_score:
     penalty = disagreement * 0.08 if disagreement > 55 else 0
     final_confidence = max(0, min(100, js_round(hybrid_score - penalty)))
 
-    # Seulement deux catégories : ORGE CONFIRMÉ vs NON-ORGE. Seuil à 44% (port de la
-    # modification en cours sur main au moment du portage — voir git log analyze-parcel.ts) :
-    # un score Agro élevé (souvent 70-95%, ses composantes retombant sur des valeurs neutres
-    # généreuses quand une donnée manque) suffisait seul à faire basculer en orge même quand
-    # le CNN penchait pour non-orge — 44% exige une vraie majorité CNN+Agro en faveur de l'orge.
-    final_is_barley = hybrid_score > 44
+    # Seulement deux catégories : ORGE CONFIRMÉ vs NON-ORGE. Seuil à 50% (corrigé lors de
+    # l'audit du portage Python — le code source TS portait `> 44` mais son propre
+    # commentaire documentait l'intention `> 50` : "Remonté à 50% (depuis 43%)... 50% exige
+    # une vraie majorité"; décision utilisateur du 2026-09-04 de suivre l'intention
+    # documentée). Un score Agro élevé (souvent 70-95%, ses composantes retombant sur des
+    # valeurs neutres généreuses quand une donnée manque) suffisait seul à faire basculer en
+    # orge même quand le CNN penchait pour non-orge — 50% exige une vraie majorité CNN+Agro
+    # en faveur de l'orge.
+    final_is_barley = hybrid_score > 50
 
     verdict = "✅ ORGE CONFIRMÉE — CNN + Règles agro concordent" if final_is_barley else "❌ NON-ORGE — CNN + Règles agro concordent"
     if disagreement > 55:
