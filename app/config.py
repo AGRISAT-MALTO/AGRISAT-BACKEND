@@ -8,6 +8,10 @@ class Settings(BaseSettings):
     gee_service_account_key: str = "{}"
     hf_model_url: str = ""
     field_segmentation_model_url: str = "http://localhost:8000"
+    vhr_model_url: str = "http://localhost:8010"
+    # Cache disque des zones tracees par le service VHR (vide : AGRISAT-BACKEND/.cache/vhr_parcels).
+    vhr_cache_dir: str = ""
+    vhr_cache_ttl_days: float = 30.0
     google_maps_api_key: str = ""
     airbus_oneatlas_api_key: str = ""
     port: int = 3001

@@ -9,6 +9,8 @@ from app.routes import (
     parcelles,
     planet,
     sentinel_tiles,
+    zone_crops,
+    zone_parcels,
     zoning,
 )
 
@@ -22,3 +24,5 @@ api_router.include_router(detect_parcels.router)
 api_router.include_router(analyze_simple.router)
 api_router.include_router(sentinel_tiles.router)
 api_router.include_router(field_segmentation.router)
+api_router.include_router(zone_crops.router)
+api_router.include_router(zone_parcels.router)

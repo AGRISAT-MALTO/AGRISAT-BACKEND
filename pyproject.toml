@@ -17,6 +17,7 @@ dependencies = [
     "requests>=2.32,<3",  # transport requis par google.auth.transport.requests.Request (credentials.refresh)
     "numpy>=1.26,<3",
     "shapely>=2.0,<3",
+    "pyarrow>=15",  # lecture par blocs du GeoParquet Fields of The World (app/services/zone_parcels.py)
 ]
 
 [build-system]
