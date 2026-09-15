@@ -1,6 +1,9 @@
 """Port 1:1 de src/automatic-parcels.ts : détection automatique de parcelles autour d'un
-point (cascade OSM Overpass + base -> modèle U-Net -> watershed GEE -> SNIC GEE -> cellules
-satellite), et calcul des degrés-jours de croissance (GDD, Open-Meteo).
+point, et calcul des degrés-jours de croissance (GDD, Open-Meteo).
+
+Candidats analysés : en priorité les parcelles déjà tracées à l'écran (modèle JECAM-VHR),
+envoyées par le frontend et classées entières (orge ou non). À défaut, cascade OSM
+Overpass + base -> modèle U-Net -> watershed GEE -> cellules satellite.
 
 Fidélité : le clipping Sutherland-Hodgman (clip_polygon_to_radius), la compacité de
 Polsby-Popper (is_plausible_field_shape), et toute la géométrie locale (offset_point,
@@ -30,17 +33,16 @@ from app.services.analyze_parcel import (
     add_spectral_index,
     analyze_parcel as _analyze_parcel_handler,
     approximate_polygon_area_m2,
-    call_gee_compute_raw,
-    extract_latlng_from_geometry,
     fetch_with_retry,
     gee_call,
     gee_constant,
     gee_image_constant,
     get_gee_access_token,
     get_gee_project_id,
-    is_gee_feature_collection,
     js_round,
     map_with_concurrency,
+    normalize_polygon,
+    segment_zoom_for_area,
 )
 from app.services.field_watershed import (
     lng_lat_to_mercator_meters,
@@ -70,6 +72,7 @@ MAX_CANDIDATES = 48
 MAX_SATELLITE_CELLS = 36
 ANALYSIS_CONCURRENCY = 4
 ANALYSIS_TIME_BUDGET_S = 60.0
+TRACED_ANALYSIS_TIME_BUDGET_S = 180.0
 
 GeeValue = dict[str, Any]
 
@@ -463,118 +466,33 @@ async def _discover_agricultural_parcels_from_watershed(lat: float, lng: float, 
     return candidates
 
 
-# ── Segmentation GEE/SNIC (sans modèle ML) ──
+# ── Parcelles déjà tracées à l'écran (modèle JECAM-VHR) ──
 
-REGION_SNIC_PARAMETERS = {"size": 24, "compactness": 0.6, "connectivity": 8, "scale": 10}
-MIN_PARCEL_SEGMENT_AREA_M2 = 1_000
-MAX_PARCEL_SEGMENT_AREA_M2 = 800_000
-MAX_SEGMENTATION_RADIUS_KM = 5
-CIRCLE_REGION_VERTICES = 48
+TRACED_PARCEL_SOURCE = "jecam-vhr"
 
 
-def _build_region_snic_expression(lat: float, lng: float, radius_km: float) -> dict:
-    end_date = datetime.now(timezone.utc).date().isoformat()
-    start_date = (datetime.now(timezone.utc) - timedelta(days=90)).date().isoformat()
-    values: dict[str, GeeValue] = {}
-
-    def reference(name: str) -> GeeValue:
-        return {"valueReference": name}
-
-    values["region"] = gee_call("GeometryConstructors.Polygon", {"coordinates": gee_constant(_circle_region_coordinates(lat, lng, radius_km, CIRCLE_REGION_VERTICES))})
-    values["intersectsRegion"] = gee_call("Filter.intersects", {"leftField": gee_constant(".all"), "rightValue": gee_call("Feature", {"geometry": reference("region")})})
-    values["dateRange"] = gee_call("Filter.dateRangeContains", {"leftValue": gee_call("DateRange", {"start": gee_constant(start_date), "end": gee_constant(end_date)}), "rightField": gee_constant("system:time_start")})
-    values["lowCloudCover"] = gee_call("Filter.lessThan", {"leftField": gee_constant("CLOUDY_PIXEL_PERCENTAGE"), "rightValue": gee_constant(35)})
-    values["collectionByRegion"] = gee_call("Collection.filter", {"collection": gee_call("ImageCollection.load", {"id": gee_constant("COPERNICUS/S2_SR_HARMONIZED")}), "filter": reference("intersectsRegion")})
-    values["collectionByDate"] = gee_call("Collection.filter", {"collection": reference("collectionByRegion"), "filter": reference("dateRange")})
-    values["collection"] = gee_call("Collection.filter", {"collection": reference("collectionByDate"), "filter": reference("lowCloudCover")})
-    values["composite"] = gee_call("reduce.median", {"collection": reference("collection")})
-    values["spectralImage"] = gee_call("Image.select", {"input": reference("composite"), "bandSelectors": gee_constant(["B2", "B3", "B4", "B8", "B11", "B12"])})
-    values["withNdvi"] = add_spectral_index(reference("spectralImage"), "NDVI", ("B8", "B4"))
-    values["withNdwi"] = add_spectral_index(reference("withNdvi"), "NDWI", ("B3", "B8"))
-    values["withNdbi"] = add_spectral_index(reference("withNdwi"), "NDBI", ("B11", "B8"))
-    values["segmentationImage"] = add_bare_soil_index(reference("withNdbi"))
-
-    def image_band(name: str) -> GeeValue:
-        return gee_call("Image.select", {"input": reference("segmentationImage"), "bandSelectors": gee_constant([name])})
-
-    values["ndviMask"] = gee_call("Image.gt", {"image1": image_band("NDVI"), "image2": gee_image_constant(0.15)})
-    values["waterMask"] = gee_call("Image.lt", {"image1": image_band("NDWI"), "image2": gee_image_constant(0.1)})
-    values["urbanMask"] = gee_call("Image.lt", {"image1": image_band("NDBI"), "image2": gee_image_constant(0.05)})
-    values["bareSoilMask"] = gee_call("Image.lt", {"image1": image_band("BSI"), "image2": gee_image_constant(0.25)})
-    values["fieldMask"] = gee_call(
-        "Image.and",
-        {"image1": gee_call("Image.and", {"image1": gee_call("Image.and", {"image1": reference("ndviMask"), "image2": reference("waterMask")}), "image2": reference("urbanMask")}), "image2": reference("bareSoilMask")},
-    )
-    values["maskedImage"] = gee_call("Image.updateMask", {"image": reference("segmentationImage"), "mask": reference("fieldMask")})
-    values["fieldImage"] = gee_call("Image.clip", {"input": reference("maskedImage"), "geometry": reference("region")})
-    values["snic"] = gee_call(
-        "Image.Segmentation.SNIC",
-        {
-            "image": reference("fieldImage"),
-            "size": gee_constant(REGION_SNIC_PARAMETERS["size"]),
-            "compactness": gee_constant(REGION_SNIC_PARAMETERS["compactness"]),
-            "connectivity": gee_constant(REGION_SNIC_PARAMETERS["connectivity"]),
-            "neighborhoodSize": gee_constant(REGION_SNIC_PARAMETERS["size"] * 4),
-        },
-    )
-    values["snicClusters"] = gee_call("Image.select", {"input": reference("snic"), "bandSelectors": gee_constant(["clusters"])})
-    values["vectorsImage"] = gee_call("Image.addBands", {"dstImg": reference("snicClusters"), "srcImg": reference("fieldImage")})
-    values["vectors"] = gee_call(
-        "Image.reduceToVectors",
-        {
-            "image": reference("vectorsImage"),
-            "reducer": gee_call("Reducer.mean", {}),
-            "geometry": reference("region"),
-            "scale": gee_constant(REGION_SNIC_PARAMETERS["scale"]),
-            "geometryType": gee_constant("polygon"),
-            "eightConnected": gee_constant(True),
-            "labelProperty": gee_constant("segment_id"),
-            "bestEffort": gee_constant(True),
-            "maxPixels": gee_constant(30_000_000),
-            "tileScale": gee_constant(4),
-        },
-    )
-
-    return {"expression": {"result": "vectors", "values": values}}
-
-
-async def _discover_agricultural_parcels_from_gee_segmentation(lat: float, lng: float, radius_km: float) -> list[dict[str, Any]]:
-    service_account_json = settings.gee_service_account_key
-    if not service_account_json or service_account_json.startswith("VOTRE_"):
-        return []
-    if radius_km > MAX_SEGMENTATION_RADIUS_KM:
-        return []
-
-    access_token = await get_gee_access_token()
-    project_id = get_gee_project_id()
-    raw = await call_gee_compute_raw(access_token, project_id, _build_region_snic_expression(lat, lng, radius_km))
-    result = raw.get("result")
-    if not is_gee_feature_collection(result):
-        return []
-
+def _traced_parcel_candidates(traced_parcels: list[dict[str, Any]], lat: float, lng: float, radius_km: float) -> list[dict[str, Any]]:
+    """Parcelles tracées envoyées par le frontend qui recoupent le cercle de recherche, de la
+    plus proche à la plus éloignée. Pas de découpage au rayon : chaque parcelle est classée
+    entière (orge ou non)."""
+    center = {"lat": lat, "lng": lng}
     candidates: list[dict[str, Any]] = []
-    for index, feature in enumerate(result["features"]):
-        if not isinstance(feature, dict):
+    for parcel in traced_parcels:
+        coordinates = normalize_polygon(parcel.get("coordinates"))
+        if coordinates is None:
             continue
-        coordinates = extract_latlng_from_geometry(feature.get("geometry"))
-        if len(coordinates) < 3:
-            continue
+        parcel_center = _polygon_center(coordinates)
+        candidate = {
+            "id": f"{TRACED_PARCEL_SOURCE}-{parcel_center['lat']:.6f}-{parcel_center['lng']:.6f}",
+            "coordinates": coordinates,
+            "center": parcel_center,
+            "tags": {"source": TRACED_PARCEL_SOURCE},
+        }
+        if _is_parcel_within_radius(candidate, center, radius_km):
+            candidates.append(candidate)
 
-        area_m2 = approximate_polygon_area_m2(coordinates)
-        if area_m2 < MIN_PARCEL_SEGMENT_AREA_M2 or area_m2 > MAX_PARCEL_SEGMENT_AREA_M2:
-            continue
-        if not _is_plausible_field_shape(coordinates, area_m2):
-            continue
-
-        properties = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
-        ndvi = properties.get("NDVI")
-        tags = {"source": "gee-snic-segmentation"}
-        if isinstance(ndvi, (int, float)) and not isinstance(ndvi, bool):
-            tags["ndvi_hint"] = str(js_round(ndvi * 1000) / 1000)
-
-        candidates.append({"id": f"gee-snic-{lat:.6f}-{lng:.6f}-{index}", "coordinates": coordinates, "center": _polygon_center(coordinates), "tags": tags})
-
-    return candidates
+    candidates.sort(key=lambda candidate: _distance_between_points(center, candidate["center"]))
+    return _deduplicate_by_center(candidates)
 
 
 # ── Overpass (OSM) ──
@@ -933,12 +851,6 @@ async def _discover_agricultural_parcels(lat: float, lng: float, radius_km: floa
         except Exception as error:  # noqa: BLE001
             logger.warning("discoverAgriculturalParcelsFromWatershed failed, trying next fallback: %s", error)
 
-    if not traced_candidates:
-        try:
-            traced_candidates = await _discover_agricultural_parcels_from_gee_segmentation(lat, lng, radius_km)
-        except Exception as error:  # noqa: BLE001
-            logger.warning("discoverAgriculturalParcelsFromGeeSegmentation failed, trying next fallback: %s", error)
-
     merged_candidates = _deduplicate_by_center(known_candidates + traced_candidates)
     return _ensure_coordinate_coverage(merged_candidates, lat, lng, radius_km)
 
@@ -959,9 +871,13 @@ def _as_string_array(value: Any) -> list[str]:
 
 
 async def _analyze_candidate(candidate: dict[str, Any], config: dict[str, float]) -> dict[str, Any]:
+    zoom = 15
+    if candidate["tags"].get("source") == TRACED_PARCEL_SOURCE:
+        # Parcelles tracées souvent sous 1 ha : on cadre l'image envoyée au CNN sur la parcelle.
+        zoom = segment_zoom_for_area(approximate_polygon_area_m2(candidate["coordinates"]), candidate["center"]["lat"], zoom)
     try:
         status, data = await _analyze_parcel_handler(
-            {"lat": candidate["center"]["lat"], "lng": candidate["center"]["lng"], "zoom": 15, "polygon": candidate["coordinates"]}
+            {"lat": candidate["center"]["lat"], "lng": candidate["center"]["lng"], "zoom": zoom, "polygon": candidate["coordinates"]}
         )
     except Exception as error:  # noqa: BLE001
         return {**candidate, "analysis": None, "analysis_error": str(error) or "Analyse satellite indisponible."}
@@ -1150,21 +1066,25 @@ async def detect_automatic_parcels(request: dict[str, Any]) -> dict[str, Any]:
     base_temperature, threshold, period_days = request["baseTemperature"], request["threshold"], request["periodDays"]
 
     try:
-        candidates = await _discover_agricultural_parcels(lat, lng, radius_km)
+        # Les parcelles déjà tracées à l'écran (JECAM-VHR) sont classées en priorité ; la cascade
+        # de découverte ne sert que si aucune n'a encore été tracée dans le rayon.
+        traced_candidates = _traced_parcel_candidates(request.get("tracedParcels") or [], lat, lng, radius_km)
+        candidates = traced_candidates or await _discover_agricultural_parcels(lat, lng, radius_km)
         config = {"baseTemperature": base_temperature, "threshold": threshold, "periodDays": period_days}
         analyzed_candidates = candidates[:MAX_CANDIDATES]
         field_model_fallback = any(c["tags"].get("source") == "field-boundary-model" for c in analyzed_candidates)
         watershed_fallback = not field_model_fallback and any(c["tags"].get("source") == "gee-watershed-segmentation" for c in analyzed_candidates)
-        gee_segmentation_fallback = not field_model_fallback and not watershed_fallback and any(c["tags"].get("source") == "gee-snic-segmentation" for c in analyzed_candidates)
         satellite_window_fallback = (
             not field_model_fallback
             and not watershed_fallback
-            and not gee_segmentation_fallback
             and any((c["tags"].get("source") or "").startswith("satellite-search") for c in analyzed_candidates)
         )
 
+        # Parcelles tracées : petites et nombreuses, ~25-30 s d'analyse chacune — le budget de
+        # 60 s n'en laissait passer que 8 environ.
+        time_budget_s = TRACED_ANALYSIS_TIME_BUDGET_S if traced_candidates else ANALYSIS_TIME_BUDGET_S
         analyzed_results = await _map_with_concurrency_deadline(
-            analyzed_candidates, ANALYSIS_CONCURRENCY, ANALYSIS_TIME_BUDGET_S, lambda candidate: _analyze_candidate(candidate, config)
+            analyzed_candidates, ANALYSIS_CONCURRENCY, time_budget_s, lambda candidate: _analyze_candidate(candidate, config)
         )
         analyzed_parcels = [
             analyzed_results.get(
@@ -1180,12 +1100,14 @@ async def detect_automatic_parcels(request: dict[str, Any]) -> dict[str, Any]:
             if candidate["id"] not in analyzed_ids
         ]
 
-        if field_model_fallback:
+        if traced_candidates:
+            notice = f"{len(traced_candidates)} parcelle(s) déjà tracée(s) (JECAM-VHR) dans le rayon, classée(s) entière(s) : orge ou non."
+            if len(traced_candidates) > MAX_CANDIDATES:
+                notice += f" Seules les {MAX_CANDIDATES} plus proches du point sont analysées."
+        elif field_model_fallback:
             notice = "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par le modèle de segmentation U-Net (IA, entraîné sur AI4Boundaries)."
         elif watershed_fallback:
             notice = "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par watershed + analyse NDVI multi-temporelle (Google Earth Engine, sans modèle IA)."
-        elif gee_segmentation_fallback:
-            notice = "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par segmentation d'image satellite (SNIC / Google Earth Engine, sans modèle IA)."
         elif satellite_window_fallback:
             notice = "Aucun contour vectoriel n'a été trouvé : plusieurs cellules satellite autour du point sont analysées sans créer de fausse parcelle en base."
         elif len(candidates) == 0:

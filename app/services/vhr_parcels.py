@@ -11,19 +11,33 @@ Pourquoi un service separe
 Le modele exige torch et ultralytics (~2,5 Go). Comme pour le U-Net de
 field_segmentation, il tourne a part et le backend l'appelle en HTTP.
 
-Qualite mesuree - 831 parcelles JECAM de test, jamais vues a l'entrainement
---------------------------------------------------------------------------
-    19,9 % bien tracees (IoU >= 0,5), IoU median 0,203
-    > 1 ha : 84 %   0,5-1 ha : 82 %   0,25-0,5 ha : 69 %   0,1-0,25 ha : 33 %   < 0,1 ha : 8 %
+Deux modes de tracage
+---------------------
+  simple : une image. ~30-60 s pour 1 km : trace a la demande.
+  mix    : 5 dates d'image (archive Esri Wayback), ~5-7 min pour 1 km : precalcule
+           par agri_field_segmentation/src/precalcul_malto.py, qui remplit le
+           cache ci-dessous. Un resultat mix en cache est TOUJOURS servi en
+           priorite ; sinon la zone est tracee en mode simple.
 
-Temps : ~30 s pour un rayon de 800 m sur CPU, d'ou le rayon plafonne a 1 km.
+Qualite mesuree - 831 parcelles JECAM de test, jamais vues a l'entrainement,
+avec la chaine de production du service (detections fusionnees, sans chevauchement)
+--------------------------------------------------------------------------
+    simple : 15,2 % bien tracees (IoU >= 0,5), IoU median 0,148
+             > 1 ha : 79 %   0,5-1 ha : 78 %   0,25-0,5 ha : 46 %   0,1-0,25 ha : 25 %   < 0,1 ha : 5 %
+    mix    : 18,5 % bien tracees, IoU median 0,187
+             > 1 ha : 79 %   0,5-1 ha : 70 %   0,25-0,5 ha : 43 %   0,1-0,25 ha : 29 %   < 0,1 ha : 10 %
+(Le 19,9 % annonce a l'entrainement portait sur les detections brutes, qui se
+chevauchent : il surestime ce que voit l'utilisateur.)
+
+Rayon plafonne a 1 km.
 
 Cache : le frontend trace l'ecran en zones fixes (centres toujours identiques),
 chaque zone est donc gardee sur disque et resservie instantanement a la visite
 suivante. Deux requetes simultanees sur la meme zone ne lancent qu'un tracage.
 
-Licences : Delineate Anything est sous AGPL-3.0 ; l'image Esri World Imagery
-est soumise aux conditions d'Esri. A verifier avant toute mise en production.
+Licences : Delineate Anything est sous AGPL-3.0 ; les images Esri World Imagery
+et Wayback sont soumises aux conditions d'Esri. A verifier avant toute mise en
+production.
 """
 
 from __future__ import annotations
@@ -45,16 +59,24 @@ logger = logging.getLogger("agrisat.services.vhr_parcels")
 
 MAX_RADIUS_M = 1_000.0
 MAX_REQUEST_RADIUS_M = 20_000.0
-TIMEOUT_S = 300.0
+MODES = ("simple", "mix")
+TIMEOUT_S = {"simple": 300.0, "mix": 1_800.0}
 
 TRANCHES = [(0, 0.1, "< 0,1 ha"), (0.1, 0.5, "0,1-0,5 ha"),
             (0.5, 1.0, "0,5-1 ha"), (1.0, math.inf, "> 1 ha")]
 
-AVERTISSEMENT_FIABILITE = (
-    "Contours traces automatiquement sur image a ~1,2 m : fiables au-dessus de 0,5 ha "
-    "(environ 80 % bien traces), incertains entre 0,1 et 0,5 ha (33 a 69 %), rarement "
-    "justes sous 0,1 ha (8 %). Qualite mesuree autour d'Antsirabe seulement."
-)
+AVERTISSEMENT_FIABILITE = {
+    "simple": (
+        "Contours traces automatiquement sur image a ~1,2 m : fiables au-dessus de 0,5 ha "
+        "(environ 78 % bien traces), incertains entre 0,1 et 0,5 ha (25 a 46 %), rarement "
+        "justes sous 0,1 ha (5 %). Qualite mesuree autour d'Antsirabe seulement."
+    ),
+    "mix": (
+        "Contours traces sur 5 dates d'image a ~1,2 m (zone precalculee) : fiables au-dessus "
+        "de 0,5 ha (environ 74 % bien traces), incertains entre 0,1 et 0,5 ha (29 a 43 %), "
+        "rarement justes sous 0,1 ha (10 %). Qualite mesuree autour d'Antsirabe seulement."
+    ),
+}
 
 
 class VhrParcelsError(RuntimeError):
@@ -71,8 +93,10 @@ def _cache_dir() -> Path:
     return Path(__file__).resolve().parents[2] / ".cache" / "vhr_parcels"
 
 
-def _cache_path(latitude: float, longitude: float, radius_m: float) -> Path:
-    return _cache_dir() / f"{latitude:.5f}_{longitude:.5f}_{round(radius_m)}.json"
+def _cache_path(latitude: float, longitude: float, radius_m: float, mode: str = "simple") -> Path:
+    # Mode simple : nom historique, sans suffixe, pour garder les zones deja en cache.
+    suffixe = "" if mode == "simple" else f"_{mode}"
+    return _cache_dir() / f"{latitude:.5f}_{longitude:.5f}_{round(radius_m)}{suffixe}.json"
 
 
 def _read_cache(path: Path) -> dict[str, Any] | None:
@@ -94,15 +118,16 @@ def _write_cache(path: Path, data: dict[str, Any]) -> None:
         logger.warning("Cache VHR non ecrit (%s) : %s", path, exc)
 
 
-async def _call_trace_service(latitude: float, longitude: float, radius_m: float) -> dict[str, Any]:
+async def _call_trace_service(latitude: float, longitude: float, radius_m: float,
+                              mode: str) -> dict[str, Any]:
     url = f"{settings.vhr_model_url.rstrip('/')}/trace"
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+        async with httpx.AsyncClient(timeout=TIMEOUT_S[mode]) as client:
             resp = await client.post(url, json={
-                "latitude": latitude, "longitude": longitude, "radius_m": radius_m})
+                "latitude": latitude, "longitude": longitude, "radius_m": radius_m, "mode": mode})
     except httpx.TimeoutException as exc:
         raise VhrServiceUnavailable(
-            f"Le tracage a depasse {int(TIMEOUT_S)} s. Essayez un rayon plus petit.") from exc
+            f"Le tracage a depasse {int(TIMEOUT_S[mode])} s. Essayez un rayon plus petit.") from exc
     except httpx.HTTPError as exc:
         raise VhrServiceUnavailable(
             f"Service de tracage injoignable ({settings.vhr_model_url}). Lancez-le depuis "
@@ -117,22 +142,24 @@ async def _call_trace_service(latitude: float, longitude: float, radius_m: float
         raise VhrParcelsError(f"Tracage impossible : {detail}")
 
     data = resp.json()
-    _write_cache(_cache_path(latitude, longitude, radius_m), data)
+    _write_cache(_cache_path(latitude, longitude, radius_m, mode), data)
     return data
 
 
 _inflight: dict[Path, asyncio.Task] = {}
 
 
-async def _trace(latitude: float, longitude: float, radius_m: float) -> dict[str, Any]:
-    path = _cache_path(latitude, longitude, radius_m)
-    cached = _read_cache(path)
-    if cached is not None:
-        return {**cached, "cached": True}
+async def _trace(latitude: float, longitude: float, radius_m: float, mode: str) -> dict[str, Any]:
+    # Une zone precalculee en mode mix passe avant le mode simple.
+    for mode_cache in ("mix", "simple") if mode == "simple" else ("mix",):
+        cached = _read_cache(_cache_path(latitude, longitude, radius_m, mode_cache))
+        if cached is not None:
+            return {**cached, "cached": True}
 
+    path = _cache_path(latitude, longitude, radius_m, mode)
     task = _inflight.get(path)
     if task is None:
-        task = asyncio.ensure_future(_call_trace_service(latitude, longitude, radius_m))
+        task = asyncio.ensure_future(_call_trace_service(latitude, longitude, radius_m, mode))
         _inflight[path] = task
         task.add_done_callback(lambda t: (_inflight.pop(path, None), t.cancelled() or t.exception()))
     # shield : si le navigateur abandonne la requete, le tracage va au bout et remplit le cache.
@@ -145,20 +172,24 @@ async def zone_parcels_vhr(
     radius_m: float,
     min_confidence: float = 0.0,
     min_area_ha: float = 0.0,
+    mode: str = "simple",
 ) -> dict[str, Any]:
     """Parcelles tracees automatiquement dans un cercle, au format de /api/zone-parcels."""
     if radius_m <= 0:
         raise VhrParcelsError("Le rayon doit etre positif.")
+    if mode not in MODES:
+        raise VhrParcelsError(f"Mode inconnu : {mode} (attendu : {', '.join(MODES)}).")
     rayon_demande = float(radius_m)
     radius_m = min(rayon_demande, MAX_RADIUS_M)
 
-    data = await _trace(latitude, longitude, radius_m)
+    data = await _trace(latitude, longitude, radius_m, mode)
+    mode_resultat = data.get("mode", "simple")
     features = [
         f for f in data.get("geojson", {}).get("features", [])
         if f["properties"]["confidence"] >= min_confidence
         and f["properties"]["area_ha"] >= min_area_ha
     ]
-    logger.info("zone-parcels VHR : %d parcelles (%.1f s%s)", len(features),
+    logger.info("zone-parcels VHR : %d parcelles, mode %s (%.1f s%s)", len(features), mode_resultat,
                 data.get("duration_s", 0.0), ", cache" if data.get("cached") else "")
 
     surfaces = np.array([f["properties"]["area_ha"] for f in features]) if features else np.zeros(0)
@@ -168,7 +199,7 @@ async def zone_parcels_vhr(
                         "plusieurs minutes.")
     if not features:
         warnings.append("Aucune parcelle detectee dans ce rayon.")
-    warnings.append(AVERTISSEMENT_FIABILITE)
+    warnings.append(AVERTISSEMENT_FIABILITE.get(mode_resultat, AVERTISSEMENT_FIABILITE["simple"]))
 
     return {
         "query": {"latitude": latitude, "longitude": longitude, "radius_m": radius_m,
@@ -183,6 +214,7 @@ async def zone_parcels_vhr(
             ],
             "quality": data.get("quality", {}),
             "outside_coverage": False,
+            "mode": mode_resultat,
         },
         "attribution": data.get("attribution", ""),
         "warnings": warnings,

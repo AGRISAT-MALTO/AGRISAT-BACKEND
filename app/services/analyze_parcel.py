@@ -1,5 +1,5 @@
 """Port 1:1 de src/analyze-parcel.ts : analyse détaillée d'une parcelle (indices
-spectraux GEE, séries temporelles, SNIC, classification CNN HuggingFace, scoring
+spectraux GEE, séries temporelles, classification CNN HuggingFace, scoring
 agro/hybride, détection de date de plantation) — et, en même temps, le client REST
 Google Earth Engine partagé par automatic_parcels.py, barley_detect_simple.py,
 zoning.py et app/routes/sentinel_tiles.py (mêmes primitives : auth, gee_call/
@@ -37,11 +37,6 @@ logger = logging.getLogger("agrisat.analyze_parcel")
 HF_MODEL_URL = settings.hf_model_url or "https://andritinatonny-agrisat.hf.space"
 GOOGLE_MAPS_API_KEY = settings.google_maps_api_key
 
-SNIC_PARAMETERS = {"size": 15, "compactness": 0.75, "connectivity": 8, "neighborhoodSize": 60, "scale": 10}
-MIN_SEGMENT_AREA_M2 = 2_500
-MAX_SEGMENT_AREA_M2 = 500_000
-MAX_SEGMENTS_TO_CLASSIFY = 12
-SEGMENT_CLASSIFY_CONCURRENCY = 3
 MIN_BARLEY_CONFIDENCE = 70
 TIME_SERIES_CONCURRENCY = 1
 GEE_COMPUTE_TIMEOUT_S = 60.0
@@ -1041,158 +1036,23 @@ def detect_season(lat: float) -> str:
     return "Jachère"  # septembre
 
 
-# ── SNIC barley segment detection ──
+# ── Contour d'orge = la parcelle analysée, entière ──
 
 
-def _feature_number(properties: dict[str, Any], names: list[str]) -> float | None:
-    for name in names:
-        value = properties.get(name)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-            return value
-    return None
-
-
-def _to_segment_candidates(feature: Any) -> list[dict[str, Any]]:
-    if not isinstance(feature, dict):
+def _parcel_as_barley_segment(polygon: list[LatLng], hf_result: dict[str, Any] | None, ndvi_percentage: float | None) -> list[dict[str, Any]]:
+    """La parcelle analysée (déjà tracée, dessinée ou référencée) est classée entière, sans
+    découpage en sous-segments : si le CNN y reconnaît de l'orge avec assez de confiance,
+    son contour devient le contour d'orge affiché."""
+    if not hf_result or not hf_result["is_barley"] or hf_result["confidence"] < MIN_BARLEY_CONFIDENCE:
         return []
-    coordinates = extract_latlng_from_geometry(feature.get("geometry"))
-    if len(coordinates) < 3:
-        return []
-
-    area_m2 = approximate_polygon_area_m2(coordinates)
-    if area_m2 < MIN_SEGMENT_AREA_M2 or area_m2 > MAX_SEGMENT_AREA_M2:
-        return []
-
-    properties = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
-    ndvi = _feature_number(properties, ["NDVI", "NDVI_mean", "ndvi", "ndvi_mean"])
-    ndwi = _feature_number(properties, ["NDWI", "NDWI_mean", "ndwi", "ndwi_mean"])
-    ndbi = _feature_number(properties, ["NDBI", "NDBI_mean", "ndbi", "ndbi_mean"])
-
-    if (ndvi is not None and ndvi < 0.2) or (ndwi is not None and ndwi > 0.1) or (ndbi is not None and ndbi > 0.05):
-        return []
-
-    return [{"coordinates": coordinates, "areaM2": area_m2, "ndvi": ndvi}]
-
-
-def _build_snic_vectors_expression(polygon: Any) -> dict:
-    end_date = datetime.now(timezone.utc).date().isoformat()
-    start_date = (datetime.now(timezone.utc) - timedelta(days=90)).date().isoformat()
-    values: dict[str, GeeValue] = {}
-
-    def reference(name: str) -> GeeValue:
-        return {"valueReference": name}
-
-    values["region"] = gee_call("GeometryConstructors.Polygon", {"coordinates": gee_constant(polygon_coordinates(polygon))})
-    values["intersectsRegion"] = gee_call("Filter.intersects", {"leftField": gee_constant(".all"), "rightValue": gee_call("Feature", {"geometry": reference("region")})})
-    values["dateRange"] = gee_call("Filter.dateRangeContains", {"leftValue": gee_call("DateRange", {"start": gee_constant(start_date), "end": gee_constant(end_date)}), "rightField": gee_constant("system:time_start")})
-    values["lowCloudCover"] = gee_call("Filter.lessThan", {"leftField": gee_constant("CLOUDY_PIXEL_PERCENTAGE"), "rightValue": gee_constant(35)})
-    values["collectionByRegion"] = gee_call("Collection.filter", {"collection": gee_call("ImageCollection.load", {"id": gee_constant("COPERNICUS/S2_SR_HARMONIZED")}), "filter": reference("intersectsRegion")})
-    values["collectionByDate"] = gee_call("Collection.filter", {"collection": reference("collectionByRegion"), "filter": reference("dateRange")})
-    values["collection"] = gee_call("Collection.filter", {"collection": reference("collectionByDate"), "filter": reference("lowCloudCover")})
-    values["composite"] = gee_call("reduce.median", {"collection": reference("collection")})
-    values["spectralImage"] = gee_call("Image.select", {"input": reference("composite"), "bandSelectors": gee_constant(["B2", "B3", "B4", "B8", "B11", "B12"])})
-    values["withNdvi"] = add_spectral_index(reference("spectralImage"), "NDVI", ("B8", "B4"))
-    values["withNdwi"] = add_spectral_index(reference("withNdvi"), "NDWI", ("B3", "B8"))
-    values["withNdbi"] = add_spectral_index(reference("withNdwi"), "NDBI", ("B11", "B8"))
-    values["segmentationImage"] = add_bare_soil_index(reference("withNdbi"))
-
-    def image_band(name: str) -> GeeValue:
-        return gee_call("Image.select", {"input": reference("segmentationImage"), "bandSelectors": gee_constant([name])})
-
-    values["ndviMask"] = gee_call("Image.gt", {"image1": image_band("NDVI"), "image2": gee_image_constant(0.2)})
-    values["waterMask"] = gee_call("Image.lt", {"image1": image_band("NDWI"), "image2": gee_image_constant(0.1)})
-    values["urbanMask"] = gee_call("Image.lt", {"image1": image_band("NDBI"), "image2": gee_image_constant(0.05)})
-    values["bareSoilMask"] = gee_call("Image.lt", {"image1": image_band("BSI"), "image2": gee_image_constant(0.2)})
-    values["vegetationMask"] = gee_call(
-        "Image.and",
+    return [
         {
-            "image1": gee_call("Image.and", {"image1": gee_call("Image.and", {"image1": reference("ndviMask"), "image2": reference("waterMask")}), "image2": reference("urbanMask")}),
-            "image2": reference("bareSoilMask"),
-        },
-    )
-    values["maskedImage"] = gee_call("Image.updateMask", {"image": reference("segmentationImage"), "mask": reference("vegetationMask")})
-    values["vegetationImage"] = gee_call("Image.clip", {"input": reference("maskedImage"), "geometry": reference("region")})
-    values["snic"] = gee_call(
-        "Image.Segmentation.SNIC",
-        {
-            "image": reference("vegetationImage"),
-            "size": gee_constant(SNIC_PARAMETERS["size"]),
-            "compactness": gee_constant(SNIC_PARAMETERS["compactness"]),
-            "connectivity": gee_constant(SNIC_PARAMETERS["connectivity"]),
-            "neighborhoodSize": gee_constant(SNIC_PARAMETERS["neighborhoodSize"]),
-        },
-    )
-    values["snicClusters"] = gee_call("Image.select", {"input": reference("snic"), "bandSelectors": gee_constant(["clusters"])})
-    values["vectorsImage"] = gee_call("Image.addBands", {"dstImg": reference("snicClusters"), "srcImg": reference("vegetationImage")})
-    values["vectors"] = gee_call(
-        "Image.reduceToVectors",
-        {
-            "image": reference("vectorsImage"),
-            "reducer": gee_call("Reducer.mean", {}),
-            "geometry": reference("region"),
-            "scale": gee_constant(SNIC_PARAMETERS["scale"]),
-            "geometryType": gee_constant("polygon"),
-            "eightConnected": gee_constant(True),
-            "labelProperty": gee_constant("segment_id"),
-            "bestEffort": gee_constant(True),
-            "maxPixels": gee_constant(10_000_000),
-            "tileScale": gee_constant(2),
-        },
-    )
-
-    return {"expression": {"result": "vectors", "values": values}}
-
-
-async def _detect_barley_segments(
-    access_token: str, project_id: str, polygon: Any, fallback_zoom: int, warnings: list[str]
-) -> list[dict[str, Any]]:
-    try:
-        logger.info("[SNIC] Segmentation démarrée")
-        raw = await call_gee_compute_raw(access_token, project_id, _build_snic_vectors_expression(polygon))
-        result = raw.get("result")
-        if not is_gee_feature_collection(result):
-            logger.warning("[SNIC] Aucune image Sentinel-2 exploitable ou aucun objet vectorisé.")
-            return []
-
-        logger.info("[SNIC] Image Sentinel-2 récupérée")
-        logger.info("[SNIC] Nombre d'objets détectés : %s", len(result["features"]))
-
-        candidates: list[dict[str, Any]] = []
-        for feature in result["features"]:
-            candidates.extend(_to_segment_candidates(feature))
-        candidates.sort(key=lambda c: (-(c["ndvi"] if c["ndvi"] is not None else -1), -c["areaM2"]))
-        candidates = candidates[:MAX_SEGMENTS_TO_CLASSIFY]
-
-        logger.info("[CLASSIFICATION] Objets envoyés au modèle : %s", len(candidates))
-
-        async def classify(candidate: dict[str, Any]) -> dict[str, Any] | None:
-            try:
-                center = polygon_centroid(candidate["coordinates"])
-                thumbnail = await capture_parcel_image(
-                    center["lat"], center["lng"], segment_zoom_for_area(candidate["areaM2"], center["lat"], fallback_zoom), candidate["coordinates"]
-                )
-                classification = await call_hf_model(thumbnail)
-                if classification["is_barley"] and classification["confidence"] >= MIN_BARLEY_CONFIDENCE:
-                    return {
-                        "coordinates": candidate["coordinates"],
-                        "confidence": js_round(classification["confidence"]),
-                        "ndvi": candidate["ndvi"],
-                        "area_ha": js_round((candidate["areaM2"] / 10_000) * 100) / 100,
-                    }
-                return None
-            except Exception as error:  # noqa: BLE001
-                logger.warning("[CLASSIFICATION] Échec de la classification d'un objet : %s", error)
-                return None
-
-        classified = await map_with_concurrency(candidates, SEGMENT_CLASSIFY_CONCURRENCY, classify)
-        barley_segments = [s for s in classified if s is not None]
-
-        logger.info("[CLASSIFICATION] Orge détectée : %s", len(barley_segments))
-        return barley_segments
-    except Exception as error:  # noqa: BLE001
-        warnings.append(f"SNIC indisponible : {_error_message(error)}")
-        logger.warning("[SNIC] Échec de la segmentation : %s", error)
-        return []
+            "coordinates": polygon,
+            "confidence": js_round(hf_result["confidence"]),
+            "ndvi": ndvi_percentage / 100 if ndvi_percentage is not None else None,
+            "area_ha": js_round((approximate_polygon_area_m2(polygon) / 10_000) * 100) / 100,
+        }
+    ]
 
 
 # ── Main handler ──
@@ -1251,12 +1111,6 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         if isinstance(rain_result, BaseException):
             warnings.append(f"Précipitations indisponibles : {_error_message(rain_result)}")
 
-        if access_token:
-            detected_segments = await _detect_barley_segments(access_token, project_id, parcel_polygon, effective_zoom, warnings)
-        else:
-            detected_segments = []
-            warnings.append("SNIC non exécuté : authentification GEE indisponible.")
-
         satellite_image: str | None = None
         try:
             satellite_image = await capture_parcel_image(lat, lng, effective_zoom, parcel_polygon)
@@ -1266,6 +1120,7 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         planting = detect_planting_date(time_series["s2"], time_series["s1"])
         agro = compute_agro_score(sat_data, planting, time_series)
         hf_result = await _call_hf_model_safely(satellite_image, warnings) if satellite_image else None
+        detected_segments = _parcel_as_barley_segment(parcel_polygon, hf_result, sat_data["ndvi"])
         hybrid = compute_hybrid_score(hf_result["confidence"], hf_result["is_barley"], agro["score"]) if hf_result else create_agro_only_hybrid_score(agro["score"])
         season = detect_season(lat)
 

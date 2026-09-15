@@ -11,6 +11,7 @@ la taille des parcelles) : l'interface doit afficher les deux.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
@@ -36,6 +37,9 @@ class ZoneParcelsRequest(BaseModel):
                             description="Ramene a 1 km par le service de tracage.")
     min_confidence: float = Field(0.0, ge=0, le=100, description="Score du modele, de 0 a 100.")
     min_area_ha: float = Field(0.0, ge=0, description="Surface minimale en hectares.")
+    mode: Literal["simple", "mix"] = Field(
+        "simple", description="mix : 5 dates d'image, ~5-7 min par zone (precalcul). "
+                              "Une zone deja precalculee en mix est servie quel que soit le mode.")
 
 
 @router.post("/api/zone-parcels")
@@ -43,7 +47,7 @@ async def post_zone_parcels(payload: ZoneParcelsRequest) -> JSONResponse:
     """Parcelles delimitees automatiquement dans un cercle (FeatureCollection)."""
     try:
         result = await zone_parcels_vhr(payload.latitude, payload.longitude, payload.radius_m,
-                                        payload.min_confidence, payload.min_area_ha)
+                                        payload.min_confidence, payload.min_area_ha, payload.mode)
     except VhrServiceUnavailable as exc:
         logger.warning("zone-parcels indisponible : %s", exc)
         return JSONResponse(status_code=503, content={"detail": str(exc)})
@@ -63,11 +67,12 @@ async def get_zone_parcels(
     radius_m: float = Query(800, gt=0, le=MAX_REQUEST_RADIUS_M),
     min_confidence: float = Query(0.0, ge=0, le=100),
     min_area_ha: float = Query(0.0, ge=0),
+    mode: Literal["simple", "mix"] = Query("simple"),
 ) -> JSONResponse:
     """Variante GET, pour tester depuis un navigateur."""
     return await post_zone_parcels(ZoneParcelsRequest(
         latitude=lat, longitude=lon, radius_m=radius_m,
-        min_confidence=min_confidence, min_area_ha=min_area_ha))
+        min_confidence=min_confidence, min_area_ha=min_area_ha, mode=mode))
 
 
 @router.get("/api/all-parcels")

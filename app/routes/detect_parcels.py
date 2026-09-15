@@ -21,6 +21,7 @@ def _to_service_request(parsed: AutomaticDetectionRequest) -> dict:
         "baseTemperature": parsed.base_temperature,
         "threshold": parsed.threshold,
         "periodDays": parsed.period_days,
+        "tracedParcels": [parcel.as_dict() for parcel in parsed.traced_parcels],
     }
 
 
