@@ -1,0 +1,26 @@
+{
+  "features": [
+    "ndvi"
+  ],
+  "mean": [
+    60.5
+  ],
+  "std": [
+    9.240825566087542
+  ],
+  "coef": [
+    1.3793909935697697
+  ],
+  "intercept": 0.10255924867500876,
+  "threshold": 0.5,
+  "calibration": {
+    "date": "2026-09-18",
+    "sources": [
+      "localisation.kml"
+    ],
+    "n_parcels": 28,
+    "n_barley": 15,
+    "loo_accuracy": 0.893,
+    "majority_baseline": 0.536
+  }
+}

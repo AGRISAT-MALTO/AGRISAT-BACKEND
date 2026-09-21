@@ -5,6 +5,10 @@ Google Earth Engine partagé par automatic_parcels.py, barley_detect_simple.py,
 zoning.py et app/routes/sentinel_tiles.py (mêmes primitives : auth, gee_call/
 gee_constant, add_spectral_index, capture d'images, fetch_with_retry).
 
+Verdict orge / non-orge : désormais donné par le classifieur Sentinel-2 calibré
+sur le terrain (barley_s2_classifier.py) ; la fusion CNN + agro ci-dessous ne
+sert plus que de repli quand il est indisponible.
+
 Fidélité : les formules d'indices spectraux, le scoring agro/hybride, la
 détection de date de plantation et les arbres d'expression GEE sont portés
 littéralement (mêmes seuils, mêmes arrondis `js_round` — équivalent exact de
@@ -30,6 +34,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 
 from app.config import settings
+from app.services.barley_s2_classifier import classify as classify_barley_s2
 from app.services.field_watershed import lng_lat_to_mercator_meters
 
 logger = logging.getLogger("agrisat.analyze_parcel")
@@ -1055,6 +1060,56 @@ def _parcel_as_barley_segment(polygon: list[LatLng], hf_result: dict[str, Any] |
     ]
 
 
+# ── Verdict par le classifieur Sentinel-2 (app/services/barley_s2_classifier.py) ──
+
+# Repère, dans data_source, les analyses dont hybrid_score porte la probabilité d'orge
+# Sentinel-2 (et non plus 0,6 × CNN + 0,4 × agro) : le frontend adapte son libellé.
+S2_CLASSIFIER_SOURCE = "Classifieur orge Sentinel-2"
+
+
+def s2_calibration_note(s2: dict[str, Any]) -> str:
+    cal = s2.get("calibration") or {}
+    if not cal:
+        return "Vérification terrain recommandée."
+    return (
+        f"Modèle calibré sur {cal.get('n_parcels')} parcelles terrain ({', '.join(cal.get('sources', []))}, "
+        f"{cal.get('date')}), exactitude estimée {js_round((cal.get('loo_accuracy') or 0) * 100)}% : "
+        "à confirmer sur le terrain hors de cette zone et de cette période."
+    )
+
+
+def verdict_from_s2(s2: dict[str, Any]) -> dict[str, Any]:
+    """Même forme que compute_hybrid_score, pour le reste de l'analyse et l'enregistrement.
+    hybrid_score porte désormais la probabilité d'orge Sentinel-2."""
+    probability = s2["probability"]
+    pct = js_round(probability * 100)
+    verdict = (
+        f"✅ ORGE CONFIRMÉE — Sentinel-2 (probabilité d'orge {pct}%)"
+        if s2["is_barley"]
+        else f"❌ NON-ORGE — Sentinel-2 (probabilité d'orge {pct}%)"
+    )
+    return {
+        "hybrid_score": pct,
+        "final_is_barley": s2["is_barley"],
+        "final_verdict": verdict,
+        "final_confidence": js_round(max(probability, 1 - probability) * 100),
+    }
+
+
+def _s2_barley_segment(polygon: list[LatLng], s2: dict[str, Any], ndvi_percentage: float | None) -> list[dict[str, Any]]:
+    """La parcelle entière devient contour d'orge si le classifieur Sentinel-2 y conclut."""
+    if not s2["is_barley"]:
+        return []
+    return [
+        {
+            "coordinates": polygon,
+            "confidence": js_round(s2["probability"] * 100),
+            "ndvi": ndvi_percentage / 100 if ndvi_percentage is not None else None,
+            "area_ha": js_round((approximate_polygon_area_m2(polygon) / 10_000) * 100) / 100,
+        }
+    ]
+
+
 # ── Main handler ──
 
 
@@ -1120,11 +1175,22 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         planting = detect_planting_date(time_series["s2"], time_series["s1"])
         agro = compute_agro_score(sat_data, planting, time_series)
         hf_result = await _call_hf_model_safely(satellite_image, warnings) if satellite_image else None
-        detected_segments = _parcel_as_barley_segment(parcel_polygon, hf_result, sat_data["ndvi"])
-        hybrid = compute_hybrid_score(hf_result["confidence"], hf_result["is_barley"], agro["score"]) if hf_result else create_agro_only_hybrid_score(agro["score"])
+        # Verdict par le classifieur Sentinel-2 calibre sur le terrain ; le CNN et le score
+        # agro restent calcules a titre indicatif. Repli sur l'ancienne fusion si le modele
+        # ou une valeur Sentinel-2 manque.
+        s2 = classify_barley_s2(sat_data)
+        if s2:
+            hybrid = verdict_from_s2(s2)
+            detected_segments = _s2_barley_segment(parcel_polygon, s2, sat_data["ndvi"])
+        else:
+            hybrid = compute_hybrid_score(hf_result["confidence"], hf_result["is_barley"], agro["score"]) if hf_result else create_agro_only_hybrid_score(agro["score"])
+            detected_segments = _parcel_as_barley_segment(parcel_polygon, hf_result, sat_data["ndvi"])
+            warnings.append("Classifieur Sentinel-2 indisponible (modèle absent ou valeurs manquantes) : verdict par l'ancienne fusion CNN + agro, peu fiable.")
         season = detect_season(lat)
 
         data_source_parts = ["Contour parcellaire réel", *sat_data["dataSource"]]
+        if s2:
+            data_source_parts.append(S2_CLASSIFIER_SOURCE)
         if hf_result:
             data_source_parts.append(f"HF OrgeDetector ({HF_MODEL_URL})")
         data_source = " + ".join(data_source_parts)
@@ -1154,19 +1220,28 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         if sat_data["vhVvRatio"] is not None and sat_data["vhVvRatio"] > 0.45:
             risk_factors.append("Structure radar type forêt")
         if not hybrid["final_is_barley"] and hybrid["final_confidence"] > 70:
-            risk_factors.append("Score hybride confirme non-orge")
+            risk_factors.append("Verdict non-orge avec une confiance élevée")
 
         detail_parts = []
-        detail_parts.append(f"CNN: {'orge' if hf_result['is_barley'] else 'non-orge'} ({hf_result['confidence']:.1f}%)" if hf_result else "CNN: indisponible")
-        detail_parts.append(f"Agro: {agro['score']}%")
-        detail_parts.append(f"Hybride: {hybrid['hybrid_score']}%")
+        if s2:
+            detail_parts.append(f"Sentinel-2: orge {js_round(s2['probability'] * 100)}%")
+        cnn_label = "CNN (indicatif)" if s2 else "CNN"
+        detail_parts.append(f"{cnn_label}: {'orge' if hf_result['is_barley'] else 'non-orge'} ({hf_result['confidence']:.1f}%)" if hf_result else f"{cnn_label}: indisponible")
+        detail_parts.append(f"Agro{' (indicatif)' if s2 else ''}: {agro['score']}%")
+        if not s2:
+            detail_parts.append(f"Hybride: {hybrid['hybrid_score']}%")
 
         soil_type = None
         if sat_data["swir"] is not None and sat_data["nir"] is not None and sat_data["nir"] != 0:
             ratio = sat_data["swir"] / sat_data["nir"]
             soil_type = "Sol argileux sec" if ratio > 1.5 else "Sol limoneux" if ratio > 1.0 else "Sol humide"
 
-        if hf_result:
+        if s2:
+            recommendations = (
+                f"{'Orge' if s2['is_barley'] else 'Non-orge'} selon les indices Sentinel-2 de la parcelle "
+                f"(probabilité d'orge {js_round(s2['probability'] * 100)}%). {s2_calibration_note(s2)}"
+            )
+        elif hf_result:
             recommendations = (
                 f"Orge {'confirmée' if hybrid['final_confidence'] > 70 else 'probable'}. Score hybride {hybrid['hybrid_score']}% (CNN {js_round(hf_result['confidence'])}% + Agro {agro['score']}%)."
                 if hybrid["final_is_barley"]
@@ -1179,14 +1254,15 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
 
         response = {
             "percentage": sat_data["ndvi"],
-            "is_barley": hf_result["is_barley"] is True if hf_result else False,
+            "is_barley": hybrid["final_is_barley"] if s2 else (hf_result["is_barley"] is True if hf_result else False),
+            "s2_prob_barley": js_round(s2["probability"] * 1000) / 10 if s2 else None,
             "detected_segments": detected_segments,
             "hf_model_url": HF_MODEL_URL,
             "hf_available": hf_result is not None,
             "verdict": hybrid["final_verdict"],
             "details": " | ".join(detail_parts),
-            "culture_detected": ("Orge" if hf_result["is_barley"] else "Non-orge") if hf_result else None,
-            "confidence": hf_result["confidence"] if hf_result else None,
+            "culture_detected": ("Orge" if hybrid["final_is_barley"] else "Non-orge") if s2 else (("Orge" if hf_result["is_barley"] else "Non-orge") if hf_result else None),
+            "confidence": hybrid["final_confidence"] if s2 else (hf_result["confidence"] if hf_result else None),
             "cnn_prob_barley": hf_result["prob_barley"] if hf_result else None,
             "cnn_prob_non_barley": hf_result["prob_non_barley"] if hf_result else None,
             "cnn_available": hf_result is not None,

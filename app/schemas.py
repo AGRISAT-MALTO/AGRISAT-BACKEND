@@ -40,7 +40,7 @@ class AnalyzeSimpleRequest(BaseModel):
     confidence_threshold: float | None = Field(default=None, ge=0.5, le=0.95, alias="confidenceThreshold")
     min_area_ha: float | None = Field(default=None, ge=0.01, le=5, alias="minAreaHa")
     base_temperature: float | None = Field(default=None, ge=-20, le=30, alias="baseTemperature")
-    threshold: float | None = Field(default=None, ge=2200, le=10_000)
+    threshold: float | None = Field(default=None, ge=2000, le=10_000)
     period_days: int | None = Field(default=None, ge=1, le=730, alias="periodDays")
     traced_parcels: list[TracedParcel] = Field(default_factory=list, max_length=MAX_TRACED_PARCELS, alias="tracedParcels")
 
@@ -54,7 +54,7 @@ class AutomaticDetectionRequest(BaseModel):
     lng: float = Field(ge=-180, le=180)
     radius_km: float = Field(ge=0.05, le=20, alias="radiusKm")
     base_temperature: float = Field(ge=-20, le=30, alias="baseTemperature")
-    threshold: float = Field(ge=2200, le=10_000)
+    threshold: float = Field(ge=2000, le=10_000)
     period_days: int = Field(ge=1, le=730, alias="periodDays")
     traced_parcels: list[TracedParcel] = Field(default_factory=list, max_length=MAX_TRACED_PARCELS, alias="tracedParcels")
 

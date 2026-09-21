@@ -12,6 +12,7 @@ detectable). Ces limites sont renvoyees dans `warnings` : affichez-les.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
@@ -32,6 +33,12 @@ class ZoneCropsRequest(BaseModel):
     min_confidence: float = Field(0.0, ge=0, le=1,
                                   description="Seuil de confiance des predictions.")
     crops: list[str] | None = Field(None, description="Filtrer sur certaines cultures.")
+    parcels: list[dict[str, Any]] | None = Field(
+        None,
+        description="Parcelles deja tracees a l'ecran (Features GeoJSON de "
+                    "/api/zone-parcels). Fournies, la culture est restituee par "
+                    "parcelle plutot que par ilot JECAM.",
+    )
 
 
 @router.post("/api/zone-crops")
@@ -44,6 +51,7 @@ async def post_zone_crops(payload: ZoneCropsRequest) -> JSONResponse:
             radius_m=payload.radius_m,
             min_confidence=payload.min_confidence,
             crops=payload.crops,
+            parcels=payload.parcels,
         )
     except ZoneCropsError as exc:
         logger.warning("zone-crops refuse : %s", exc)

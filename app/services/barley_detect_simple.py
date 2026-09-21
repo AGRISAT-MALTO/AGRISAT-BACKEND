@@ -43,7 +43,7 @@ MAX_CANDIDATE_AREA_M2 = 800_000
 MAX_CANDIDATES_TO_CLASSIFY = 20
 DEFAULT_CONFIDENCE_THRESHOLD = 0.7
 
-DEFAULT_GDD_CONFIG = {"baseTemperature": 0, "threshold": 2200, "periodDays": 365}
+DEFAULT_GDD_CONFIG = {"baseTemperature": 0, "threshold": 2000, "periodDays": 365}
 
 GeeValue = dict[str, Any]
 
