@@ -43,16 +43,15 @@ MAX_TILES = 40
 TILE_CONCURRENCY = 3
 CLASSIFY_CONCURRENCY = 3
 
-DEFAULT_MIN_AREA_HA = 0.05
+DEFAULT_MIN_AREA_HA = 0.001
 MAX_CANDIDATE_AREA_M2 = 800_000
-MAX_CANDIDATES_TO_CLASSIFY = 20
+MAX_CANDIDATES_TO_CLASSIFY = 100
 DEFAULT_CONFIDENCE_THRESHOLD = 0.7
 
 DEFAULT_GDD_CONFIG = {"baseTemperature": 0, "threshold": 2200, "periodDays": 365}
 
-NDVI_MIN = 0.3
-NDWI_MAX = 0.1
-NDRE_MIN = 0.1
+NDVI_MIN = 0.2
+NDWI_MAX = 0.2
 
 GeeValue = dict[str, Any]
 
@@ -111,7 +110,18 @@ async def analyze_fields_simple(input_data: dict[str, Any]) -> dict[str, Any]:
     tile_centers = _build_tile_centers(lat, lng, radius_m, TILE_RADIUS_M)[:MAX_TILES]
 
     async def tile_mapper(tile: dict[str, float]) -> list[dict[str, Any]]:
-        return await _fetch_candidate_polygons(access_token, project_id, tile["lat"], tile["lng"], TILE_RADIUS_M, window, min_area_ha, warnings)
+        return await _fetch_candidate_polygons(
+            access_token,
+            project_id,
+            tile["lat"],
+            tile["lng"],
+            TILE_RADIUS_M,
+            window,
+            min_area_ha,
+            warnings,
+            analysis_center=(lat, lng),
+            analysis_radius_m=radius_m,
+        )
 
     candidate_lists = await map_with_concurrency(tile_centers, TILE_CONCURRENCY, tile_mapper)
 
@@ -122,24 +132,28 @@ async def analyze_fields_simple(input_data: dict[str, Any]) -> dict[str, Any]:
     async def classify(candidate: dict[str, Any]) -> dict[str, Any] | None:
         try:
             center = polygon_centroid(candidate["coordinates"])
-            thumbnail = await capture_sentinel2_parcel_image(access_token, project_id, center["lat"], center["lng"], 17, window["startDate"], window["endDate"])
-            classification = await call_hf_model(thumbnail)
-            confidence_fraction = classification["confidence"] / 100
-            if not classification["is_barley"] or confidence_fraction < confidence_threshold:
-                return None
+            crop = classify_crop_signature(candidate)
+            if crop["class"] == "CEREALE" and gdd and gdd.get("detected") is True:
+                crop = {"class": "ORGE", "label": "Orge", "confidence": min(0.95, crop["confidence"] + 0.08)}
+            confirmation = "confirmée" if crop["class"] == "ORGE" and gdd and gdd.get("detected") is True and crop["confidence"] >= max(0.85, confidence_threshold) else "à vérifier"
             return {
                 "type": "Feature",
                 "geometry": {"type": "Polygon", "coordinates": [[[p["lng"], p["lat"]] for p in candidate["coordinates"]]]},
                 "properties": {
-                    "class": "ORGE",
-                    "confidence": js_round(confidence_fraction * 1000) / 1000,
+                    "class": crop["class"],
+                    "culture": crop["label"],
+                    "confidence": js_round(crop["confidence"] * 1000) / 1000,
+                    "confirmation": confirmation,
+                    "confirmationMethod": "degrés-jours + signature spectrale" if confirmation == "confirmée" else "signature Sentinel-2 indicative",
+                    "alternatives": crop["alternatives"],
                     "areaHa": js_round((candidate["areaM2"] / 10_000) * 100) / 100,
                     "meanNDVI": candidate["ndvi"],
                     "meanNDRE": candidate["ndre"],
+                    "meanNDWI": candidate["ndwi"],
                     "imageDate": window["imageDate"],
                     "imageAgeDays": window["imageAgeDays"],
                     "cloudPercentage": window["cloudPercentage"],
-                    "barleyPresence": "confirmed" if gdd and gdd.get("detected") is True else "probable",
+                    "barleyPresence": "confirmed" if crop["class"] == "ORGE" and gdd and gdd.get("detected") is True else "not_applicable",
                 },
             }
         except Exception as error:  # noqa: BLE001
@@ -157,8 +171,31 @@ async def analyze_fields_simple(input_data: dict[str, Any]) -> dict[str, Any]:
         "gddCumulative": gdd["cumulative"] if gdd else None, "gddThreshold": gdd_config["threshold"],
         "confidenceThreshold": confidence_threshold, "minAreaHa": min_area_ha,
         "candidatesFound": len(all_candidates), "candidatesClassified": len(candidates),
-        "warnings": warnings,
+        "warnings": warnings + ["Classification multi-cultures indicative : validation terrain recommandée."],
     }
+
+
+def classify_crop_signature(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Classe un segment selon sa signature Sentinel-2 moyenne.
+
+    Cette règle locale remplace le filtre binaire orge pour permettre une première
+    lecture multi-cultures. Elle ne remplace pas un modèle entraîné et annoté par culture.
+    """
+    ndvi = candidate.get("ndvi") if isinstance(candidate.get("ndvi"), (int, float)) else 0.0
+    ndre = candidate.get("ndre") if isinstance(candidate.get("ndre"), (int, float)) else 0.0
+    ndwi = candidate.get("ndwi") if isinstance(candidate.get("ndwi"), (int, float)) else 0.0
+
+    if ndwi > 0.18:
+        return {"class": "RIZ", "label": "Riz / zone humide", "confidence": min(0.96, 0.58 + ndwi), "alternatives": ["Maraîchage / légumes"]}
+    if ndvi >= 0.72 and ndre >= 0.28:
+        return {"class": "MAIS", "label": "Maïs / culture dense", "confidence": min(0.93, 0.55 + ndvi * 0.35), "alternatives": ["Céréale", "Maraîchage / légumes"]}
+    if ndre >= 0.20 and 0.42 <= ndvi < 0.72:
+        return {"class": "CEREALE", "label": "Céréale (orge probable)", "confidence": min(0.92, 0.55 + ndre), "alternatives": ["Maïs / culture dense", "Maraîchage / légumes"]}
+    if 0.48 <= ndvi < 0.68 and ndre < 0.20:
+        return {"class": "PDT", "label": "Pomme de terre / tubercule", "confidence": min(0.88, 0.54 + ndvi * 0.25), "alternatives": ["Maraîchage / légumes", "Autre végétation"]}
+    if ndvi >= 0.35:
+        return {"class": "MARAICHAGE", "label": "Maraîchage / légumes", "confidence": min(0.86, 0.52 + ndvi * 0.22), "alternatives": ["Pomme de terre / tubercule", "Maïs / culture dense"]}
+    return {"class": "AUTRE", "label": "Autre végétation", "confidence": 0.52, "alternatives": ["Sol nu", "Maraîchage / légumes"]}
 
 
 def _project_id_from_service_account(service_account_json: str) -> str:
@@ -187,7 +224,7 @@ async def _save_simple_field_parcelle(feature: dict[str, Any]) -> None:
     center = polygon_centroid(coordinates)
     label = f"simple-v1-{center['lat']:.5f}-{center['lng']:.5f}"
     props = feature["properties"]
-    confidence, area_ha, mean_ndvi, mean_ndre = props["confidence"], props["areaHa"], props["meanNDVI"], props["meanNDRE"]
+    confidence, area_ha, mean_ndvi, mean_ndre, mean_ndwi = props["confidence"], props["areaHa"], props["meanNDVI"], props["meanNDRE"], props["meanNDWI"]
     image_date, image_age_days, cloud_percentage, barley_presence = props["imageDate"], props["imageAgeDays"], props["cloudPercentage"], props["barleyPresence"]
     confidence_percent = js_round(confidence * 1000) / 10
     presence_label = "confirmée par degrés-jours" if barley_presence == "confirmed" else "probable (CNN seul)"
@@ -199,17 +236,18 @@ async def _save_simple_field_parcelle(feature: dict[str, Any]) -> None:
         "center_lng": center["lng"],
         "surface_ha": area_ha,
         "culture_declared": None,
-        "culture_detected": "Orge",
+        "culture_detected": props["culture"],
         "ndvi_percentage": js_round(mean_ndvi * 1000) / 10 if mean_ndvi is not None else None,
         "ndre": mean_ndre,
+        "ndwi": mean_ndwi,
         "confidence": confidence_percent,
-        "verdict": f"Orge détectée (Sentinel-2, SNIC) — confiance {confidence_percent}% · présence {presence_label}",
+        "verdict": f"{props['culture']} détectée (Sentinel-2, SNIC) — confiance {confidence_percent}% · analyse indicative",
         "details": f"Image Sentinel-2 du {image_date if image_date is not None else '—'} ({image_age_days if image_age_days is not None else '?'} j) · nuages {cloud_percentage if cloud_percentage is not None else '?'}%",
         "saison": None,
         "soil_type": None,
         "risk_factors": [],
         "recommendations": None,
-        "data_source": "Sentinel-2 simple (v1, segmentation SNIC)",
+        "data_source": "Sentinel-2 multi-cultures (indices spectraux, segmentation SNIC)",
         "owner_name": None,
         "notes": None,
         "time_series_s1": [],
@@ -321,7 +359,16 @@ async def _fetch_image_meta(access_token: str, project_id: str, lat: float, lng:
 
 
 async def _fetch_candidate_polygons(
-    access_token: str, project_id: str, lat: float, lng: float, radius_m: float, window: dict[str, Any], min_area_ha: float, warnings: list[str]
+    access_token: str,
+    project_id: str,
+    lat: float,
+    lng: float,
+    radius_m: float,
+    window: dict[str, Any],
+    min_area_ha: float,
+    warnings: list[str],
+    analysis_center: tuple[float, float] | None = None,
+    analysis_radius_m: float | None = None,
 ) -> list[dict[str, Any]]:
     values: dict[str, GeeValue] = {}
 
@@ -329,7 +376,19 @@ async def _fetch_candidate_polygons(
         return {"valueReference": name}
 
     values["point"] = gee_call("GeometryConstructors.Point", {"coordinates": gee_constant([lng, lat])})
-    values["region"] = gee_call("Geometry.buffer", {"geometry": ref("point"), "distance": gee_constant(radius_m)})
+    values["tileRegion"] = gee_call("Geometry.buffer", {"geometry": ref("point"), "distance": gee_constant(radius_m)})
+    if analysis_center is not None and analysis_radius_m is not None:
+        values["analysisPoint"] = gee_call(
+            "GeometryConstructors.Point",
+            {"coordinates": gee_constant([analysis_center[1], analysis_center[0]])},
+        )
+        values["analysisRegion"] = gee_call(
+            "Geometry.buffer",
+            {"geometry": ref("analysisPoint"), "distance": gee_constant(analysis_radius_m)},
+        )
+        values["region"] = ref("tileRegion")
+    else:
+        values["region"] = ref("tileRegion")
     values["intersects"] = gee_call("Filter.intersects", {"leftField": gee_constant(".all"), "rightValue": gee_call("Feature", {"geometry": ref("region")})})
     values["dateRange"] = gee_call("Filter.dateRangeContains", {"leftValue": gee_call("DateRange", {"start": gee_constant(window["startDate"]), "end": gee_constant(window["endDate"])}), "rightField": gee_constant("system:time_start")})
     values["raw"] = gee_call("ImageCollection.load", {"id": gee_constant("COPERNICUS/S2_SR_HARMONIZED")})
@@ -358,12 +417,12 @@ async def _fetch_candidate_polygons(
     values["ndreBand"] = gee_call("Image.select", {"input": ref("withNdwi"), "bandSelectors": gee_constant(["NDRE"])})
     values["ndwiBand"] = gee_call("Image.select", {"input": ref("withNdwi"), "bandSelectors": gee_constant(["NDWI"])})
     values["ndviOk"] = gee_call("Image.gt", {"image1": ref("ndviBand"), "image2": gee_image_constant(NDVI_MIN)})
-    values["ndreOk"] = gee_call("Image.gt", {"image1": ref("ndreBand"), "image2": gee_image_constant(NDRE_MIN)})
+    values["ndreOk"] = gee_call("Image.gt", {"image1": ref("ndreBand"), "image2": gee_image_constant(-1)})
     values["ndwiOk"] = gee_call("Image.lt", {"image1": ref("ndwiBand"), "image2": gee_image_constant(NDWI_MAX)})
     values["plausible1"] = gee_call("Image.and", {"image1": ref("ndviOk"), "image2": ref("ndreOk")})
     values["plausibleMask"] = gee_call("Image.and", {"image1": ref("plausible1"), "image2": ref("ndwiOk")})
 
-    values["maskedForSegmentation"] = gee_call("Image.updateMask", {"image": ref("withNdwi"), "mask": ref("plausibleMask")})
+    values["maskedForSegmentation"] = ref("withNdwi")
     values["vegetationImage"] = gee_call("Image.clip", {"input": ref("maskedForSegmentation"), "geometry": ref("region")})
     values["snic"] = gee_call(
         "Image.Segmentation.SNIC",
@@ -397,10 +456,35 @@ async def _fetch_candidate_polygons(
         raw = await call_gee_compute_raw(access_token, project_id, {"expression": {"result": "vectors", "values": values}})
         result = raw.get("result")
         if not is_gee_feature_collection(result):
+            logger.warning("[SIMPLE] Réponse SNIC sans FeatureCollection pour la tuile %.4f,%.4f", lat, lng)
             return []
+        logger.info("[SIMPLE] Features SNIC reçues pour la tuile %.4f,%.4f : %s", lat, lng, len(result["features"]))
         candidates = []
+        rejected_geometry = 0
+        rejected_area = 0
         for feature in result["features"]:
+            geometry = feature.get("geometry") if isinstance(feature, dict) else None
+            coordinates = extract_latlng_from_geometry(geometry)
+            if len(coordinates) < 3:
+                rejected_geometry += 1
+                continue
+            area_m2 = _approximate_polygon_area_m2_local(coordinates)
+            if area_m2 < min_area_ha * 10_000 or area_m2 > MAX_CANDIDATE_AREA_M2:
+                rejected_area += 1
+                continue
             candidates.extend(_to_polygon_candidate(feature, min_area_ha))
+        logger.info("[SIMPLE] Rejets SNIC pour la tuile %.4f,%.4f : géométrie=%s surface=%s", lat, lng, rejected_geometry, rejected_area)
+        if analysis_center is not None and analysis_radius_m is not None:
+            analysis_origin = {"lat": analysis_center[0], "lng": analysis_center[1]}
+            distances = [_haversine_meters(analysis_origin, polygon_centroid(candidate["coordinates"])) for candidate in candidates]
+            logger.info("[SIMPLE] Distance SNIC minimale %.0fm, rayon demandé %.0fm", min(distances, default=0), analysis_radius_m)
+            candidates = [
+                candidate
+                for candidate in candidates
+                if _haversine_meters(analysis_origin, polygon_centroid(candidate["coordinates"])) <= analysis_radius_m
+                or any(_haversine_meters(analysis_origin, point) <= analysis_radius_m for point in candidate["coordinates"])
+            ]
+        logger.info("[SIMPLE] Candidats conservés pour la tuile %.4f,%.4f : %s", lat, lng, len(candidates))
         return candidates
     except Exception as error:  # noqa: BLE001
         warnings.append(f"Tuile Sentinel-2 ({lat:.4f},{lng:.4f}) indisponible : {_get_error_message(error)}")
@@ -421,8 +505,9 @@ def _to_polygon_candidate(feature: Any, min_area_ha: float) -> list[dict[str, An
     properties = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
     ndvi = properties.get("NDVI") if isinstance(properties.get("NDVI"), (int, float)) else None
     ndre = properties.get("NDRE") if isinstance(properties.get("NDRE"), (int, float)) else None
+    ndwi = properties.get("NDWI") if isinstance(properties.get("NDWI"), (int, float)) else None
 
-    return [{"coordinates": coordinates, "areaM2": area_m2, "ndvi": ndvi, "ndre": ndre}]
+    return [{"coordinates": coordinates, "areaM2": area_m2, "ndvi": ndvi, "ndre": ndre, "ndwi": ndwi}]
 
 
 def _approximate_polygon_area_m2_local(coords: list[dict[str, float]]) -> float:

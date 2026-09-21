@@ -1000,7 +1000,9 @@ def compute_hybrid_score(cnn_confidence: float, cnn_is_barley: bool, agro_score:
     # valeurs neutres généreuses quand une donnée manque) suffisait seul à faire basculer en
     # orge même quand le CNN penchait pour non-orge — 50% exige une vraie majorité CNN+Agro
     # en faveur de l'orge.
-    final_is_barley = hybrid_score > 50
+    # L'agro-score seul ne suffit pas à confirmer l'orge : le CNN doit aussi
+    # identifier l'orge, sinon la parcelle reste une autre culture estimée.
+    final_is_barley = cnn_is_barley and hybrid_score > 50
 
     verdict = "✅ ORGE CONFIRMÉE — CNN + Règles agro concordent" if final_is_barley else "❌ NON-ORGE — CNN + Règles agro concordent"
     if disagreement > 55:
@@ -1008,9 +1010,31 @@ def compute_hybrid_score(cnn_confidence: float, cnn_is_barley: bool, agro_score:
 
     return {"hybrid_score": hybrid_score, "final_is_barley": final_is_barley, "final_verdict": verdict, "final_confidence": final_confidence}
 
+def estimate_non_barley_culture(sat_data: dict[str, Any], agro: dict[str, Any]) -> str:
+    """Retourne une culture indicative pour les parcelles classées non-orge.
+
+    Les indices Sentinel-2 seuls ne permettent pas une identification certaine; le
+    libellé est donc volontairement présenté comme une estimation.
+    """
+    ndvi = sat_data.get("ndvi")
+    ndwi = sat_data.get("ndwi")
+    evi = sat_data.get("evi")
+    if isinstance(ndwi, (int, float)) and ndwi > 0.18:
+        return "Riz / zone humide (estimé)"
+    if isinstance(ndvi, (int, float)) and ndvi >= 72 and isinstance(evi, (int, float)) and evi >= 45:
+        return "Maïs / culture dense (estimé)"
+    if isinstance(ndvi, (int, float)) and 48 <= ndvi < 68 and isinstance(evi, (int, float)) and evi < 45:
+        return "Pomme de terre / tubercule (estimé)"
+    if isinstance(ndvi, (int, float)) and ndvi >= 35:
+        return "Maraîchage / légumes (estimé)"
+    if isinstance(agro.get("score"), (int, float)) and agro["score"] < 35:
+        return "Sol nu ou végétation faible (estimé)"
+    return "Autre culture (estimé)"
+
 
 def create_agro_only_hybrid_score(agro_score: float) -> dict[str, Any]:
-    final_is_barley = agro_score > 50
+    # Sans CNN, aucune confirmation d'orge ne doit être produite.
+    final_is_barley = False
     verdict = (
         f"⚠️ ORGE PROBABLE (CNN indisponible, estimation agro seule) — Score agro {agro_score}%"
         if final_is_barley
@@ -1267,6 +1291,7 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         agro = compute_agro_score(sat_data, planting, time_series)
         hf_result = await _call_hf_model_safely(satellite_image, warnings) if satellite_image else None
         hybrid = compute_hybrid_score(hf_result["confidence"], hf_result["is_barley"], agro["score"]) if hf_result else create_agro_only_hybrid_score(agro["score"])
+        estimated_culture = None if hybrid["final_is_barley"] else estimate_non_barley_culture(sat_data, agro)
         season = detect_season(lat)
 
         data_source_parts = ["Contour parcellaire réel", *sat_data["dataSource"]]
@@ -1315,11 +1340,11 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             recommendations = (
                 f"Orge {'confirmée' if hybrid['final_confidence'] > 70 else 'probable'}. Score hybride {hybrid['hybrid_score']}% (CNN {js_round(hf_result['confidence'])}% + Agro {agro['score']}%)."
                 if hybrid["final_is_barley"]
-                else f"Non-orge détecté. Score hybride {hybrid['hybrid_score']}%. Vérification terrain recommandée."
+                else f"{estimated_culture}. Score hybride {hybrid['hybrid_score']}%. Vérification terrain recommandée."
             )
         else:
             recommendations = (
-                f"{'Orge probable' if hybrid['final_is_barley'] else 'Non-orge probable'} (modèle CNN indisponible, estimation basée uniquement sur les règles agronomiques, score {agro['score']}%). Vérification terrain recommandée."
+                f"{'Orge probable' if hybrid['final_is_barley'] else f'{estimated_culture}'} (modèle CNN indisponible, estimation basée uniquement sur les règles agronomiques, score {agro['score']}%). Vérification terrain recommandée."
             )
 
         response = {
@@ -1330,7 +1355,7 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             "hf_available": hf_result is not None,
             "verdict": hybrid["final_verdict"],
             "details": " | ".join(detail_parts),
-            "culture_detected": ("Orge" if hf_result["is_barley"] else "Non-orge") if hf_result else None,
+            "culture_detected": "Orge" if hybrid["final_is_barley"] else estimated_culture,
             "confidence": hf_result["confidence"] if hf_result else None,
             "cnn_prob_barley": hf_result["prob_barley"] if hf_result else None,
             "cnn_prob_non_barley": hf_result["prob_non_barley"] if hf_result else None,
