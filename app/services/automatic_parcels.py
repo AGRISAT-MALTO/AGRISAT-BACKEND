@@ -1050,6 +1050,7 @@ async def _save_automatic_analysis(candidate: dict[str, Any], analysis: dict[str
         "hybrid_score": _as_number(analysis.get("hybrid_score")),
         "cnn_prob_barley": _as_number(analysis.get("cnn_prob_barley")),
         "cnn_prob_non_barley": _as_number(analysis.get("cnn_prob_non_barley")),
+        "phenology": analysis.get("phenology") if isinstance(analysis.get("phenology"), dict) else None,
     }
 
     async with async_session_maker() as session:

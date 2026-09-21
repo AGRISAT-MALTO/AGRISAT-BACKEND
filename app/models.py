@@ -62,6 +62,9 @@ class Parcelle(Base):
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     spectral_bands: Mapped[dict | None] = mapped_column(JSONB)
     time_series_rain: Mapped[list | None] = mapped_column(JSONB)
+    # Suivi thermique Zadoks (migration 0002) : {sowing, phenology/stade + ST,
+    # harvest} — voir app/services/sowing.track_parcel().
+    phenology: Mapped[dict | None] = mapped_column(JSONB)
 
     __table_args__ = (Index("parcelles_center_lat_center_lng_idx", "center_lat", "center_lng"),)
 

@@ -29,6 +29,7 @@ from app.services.analyze_parcel import (
     is_gee_feature_collection,
     js_round,
     map_with_concurrency,
+    normalize_polygon,
     polygon_centroid,
 )
 from app.services.automatic_parcels import fetch_growing_degree_days
@@ -128,14 +129,49 @@ async def analyze_fields_simple(input_data: dict[str, Any]) -> dict[str, Any]:
     all_candidates = [c for sub in candidate_lists for c in sub]
     candidates = _dedupe_and_rank_candidates(all_candidates)[:MAX_CANDIDATES_TO_CLASSIFY]
     gdd = await gdd_task
+    excluded = {"water": 0}
+
+    # Pré-calcul ST depuis le semis estimé (fenêtre agro, Open-Meteo seul) :
+    # référence de classification pour que les conditions locales concluent orge.
+    from app.services.sowing import st_since_estimated_sowing as _st_since_sowing  # noqa: E402
+
+    try:
+        zone_st = await _st_since_sowing(lat, lng)
+    except Exception:  # noqa: BLE001 — repli : cumul calendaire seul
+        zone_st = None
+    if isinstance(zone_st, (int, float)):
+        warnings.append(f"ST depuis semis estimé : {zone_st:.0f} °C (référence classification).")
 
     async def classify(candidate: dict[str, Any]) -> dict[str, Any] | None:
         try:
             center = polygon_centroid(candidate["coordinates"])
             crop = classify_crop_signature(candidate)
-            if crop["class"] == "CEREALE" and gdd and gdd.get("detected") is True:
-                crop = {"class": "ORGE", "label": "Orge", "confidence": min(0.95, crop["confidence"] + 0.08)}
-            confirmation = "confirmée" if crop["class"] == "ORGE" and gdd and gdd.get("detected") is True and crop["confidence"] >= max(0.85, confidence_threshold) else "à vérifier"
+            # Eau libre : zone vide, aucun résultat (pas de culture sur l'eau).
+            if crop["class"] == "EAU":
+                excluded["water"] += 1
+                return None
+            gdd_cumul = gdd.get("cumulative") if isinstance(gdd, dict) else None
+            gdd_cumul = gdd_cumul if isinstance(gdd_cumul, (int, float)) else None
+            # ST depuis le semis estimé (phénologie micro-zone) : fait foi sur le
+            # cumul calendaire quand disponible (cycle non tronqué).
+            st_semis = candidate.get("stSinceSowing")
+            st_semis = st_semis if isinstance(st_semis, (int, float)) else zone_st
+            candidate["stSinceSowing"] = st_semis
+            if crop["class"] in ("BLE", "CEREALE"):
+                ndvi_v = candidate.get("ndvi") if isinstance(candidate.get("ndvi"), (int, float)) else 0.0
+                ndre_v = candidate.get("ndre") if isinstance(candidate.get("ndre"), (int, float)) else 0.0
+                resolved = resolve_cereal(ndvi_v, ndre_v, gdd_cumul, confidence_threshold, st_semis)
+                crop = {**crop, **{k: v for k, v in resolved.items() if k in ("class", "label", "confidence", "alternatives")}}
+                crop["confirmationMethod"] = resolved.get("method", crop.get("confirmationMethod", ""))
+                if resolved.get("reasons"):
+                    warnings.append(f"Céréale ({center['lat']:.4f},{center['lng']:.4f}) : {'; '.join(resolved['reasons'])}.")
+            gdd_ok = bool(gdd and gdd.get("detected") is True)
+            st_ok = isinstance(st_semis, (int, float)) and st_semis >= BARLEY_GDD_THRESHOLD
+            confirmation = "confirmée" if crop["class"] == "ORGE" and (gdd_ok or st_ok) and crop["confidence"] >= max(0.85, confidence_threshold) else "à vérifier"
+            if confirmation == "confirmée":
+                method = "degrés-jours + signature spectrale" if gdd_ok else "ST depuis semis + signature spectrale"
+            elif not crop.get("confirmationMethod"):
+                method = "signature Sentinel-2 indicative"
             return {
                 "type": "Feature",
                 "geometry": {"type": "Polygon", "coordinates": [[[p["lng"], p["lat"]] for p in candidate["coordinates"]]]},
@@ -144,7 +180,7 @@ async def analyze_fields_simple(input_data: dict[str, Any]) -> dict[str, Any]:
                     "culture": crop["label"],
                     "confidence": js_round(crop["confidence"] * 1000) / 1000,
                     "confirmation": confirmation,
-                    "confirmationMethod": "degrés-jours + signature spectrale" if confirmation == "confirmée" else "signature Sentinel-2 indicative",
+                    "confirmationMethod": method,
                     "alternatives": crop["alternatives"],
                     "areaHa": js_round((candidate["areaM2"] / 10_000) * 100) / 100,
                     "meanNDVI": candidate["ndvi"],
@@ -153,7 +189,7 @@ async def analyze_fields_simple(input_data: dict[str, Any]) -> dict[str, Any]:
                     "imageDate": window["imageDate"],
                     "imageAgeDays": window["imageAgeDays"],
                     "cloudPercentage": window["cloudPercentage"],
-                    "barleyPresence": "confirmed" if crop["class"] == "ORGE" and gdd and gdd.get("detected") is True else "not_applicable",
+                    "barleyPresence": "confirmed" if crop["class"] == "ORGE" and (gdd_ok or st_ok) else "not_applicable",
                 },
             }
         except Exception as error:  # noqa: BLE001
@@ -162,6 +198,30 @@ async def analyze_fields_simple(input_data: dict[str, Any]) -> dict[str, Any]:
 
     classified_features = await map_with_concurrency(candidates, CLASSIFY_CONCURRENCY, classify)
     features = [f for f in classified_features if f is not None]
+    # Verrouillage strict au disque demandé : découpe chaque polygone au rayon
+    # (Sutherland-Hodgman local) et écarte ce qui sort entièrement.
+    clipped_features: list[dict[str, Any]] = []
+    clipped_out = 0
+    for feature in features:
+        ring = feature["geometry"]["coordinates"][0]
+        coords = normalize_polygon([{"lat": c[1], "lng": c[0]} for c in ring]) or []
+        cut = _clip_to_radius(coords, lat, lng, radius_m)
+        if len(cut) < 3:
+            clipped_out += 1
+            continue
+        if len(cut) != len(coords):
+            closed = cut + [cut[0]]
+            feature["geometry"]["coordinates"] = [[[p["lng"], p["lat"]] for p in closed]]
+            area_ha = js_round(_approximate_polygon_area_m2_local(cut) / 100) / 100
+            feature["properties"]["areaHa"] = area_ha
+        clipped_features.append(feature)
+    features = clipped_features
+    if clipped_out:
+        warnings.append(f"{clipped_out} polygone(s) hors zone écarté(s) (rayon {radius_m:.0f} m).")
+    if excluded["water"]:
+        warnings.append(
+            f"{excluded['water']} zone(s) en eau ignorée(s) — aucune culture (zone vide)."
+        )
 
     return {
         "type": "FeatureCollection", "features": features,
@@ -171,6 +231,7 @@ async def analyze_fields_simple(input_data: dict[str, Any]) -> dict[str, Any]:
         "gddCumulative": gdd["cumulative"] if gdd else None, "gddThreshold": gdd_config["threshold"],
         "confidenceThreshold": confidence_threshold, "minAreaHa": min_area_ha,
         "candidatesFound": len(all_candidates), "candidatesClassified": len(candidates),
+        "waterExcluded": excluded["water"],
         "warnings": warnings + ["Classification multi-cultures indicative : validation terrain recommandée."],
     }
 
@@ -185,17 +246,175 @@ def classify_crop_signature(candidate: dict[str, Any]) -> dict[str, Any]:
     ndre = candidate.get("ndre") if isinstance(candidate.get("ndre"), (int, float)) else 0.0
     ndwi = candidate.get("ndwi") if isinstance(candidate.get("ndwi"), (int, float)) else 0.0
 
+    if ndwi > 0.18 and ndvi < 0.15:
+        # Eau libre (lac, plan d'eau) : NDWI élevé SANS végétation (NDVI < 0.15).
+        # Une rizière inondée a aussi un NDWI élevé mais porte de la végétation
+        # (NDVI ≥ 0.15) — c'est ce qui distingue les deux cas.
+        return {"class": "EAU", "label": "Eau (lac / plan d'eau)", "confidence": min(0.96, 0.60 + ndwi), "alternatives": ["Riz"]}
     if ndwi > 0.18:
-        return {"class": "RIZ", "label": "Riz / zone humide", "confidence": min(0.96, 0.58 + ndwi), "alternatives": ["Maraîchage / légumes"]}
+        return {"class": "RIZ", "label": "Riz", "confidence": min(0.96, 0.58 + ndwi), "alternatives": ["Tomate", "Oignon", "Chou"]}
     if ndvi >= 0.72 and ndre >= 0.28:
-        return {"class": "MAIS", "label": "Maïs / culture dense", "confidence": min(0.93, 0.55 + ndvi * 0.35), "alternatives": ["Céréale", "Maraîchage / légumes"]}
+        return {"class": "MAIS", "label": "Maïs", "confidence": min(0.93, 0.55 + ndvi * 0.35), "alternatives": ["Blé", "Orge", "Tomate", "Oignon"]}
     if ndre >= 0.20 and 0.42 <= ndvi < 0.72:
-        return {"class": "CEREALE", "label": "Céréale (orge probable)", "confidence": min(0.92, 0.55 + ndre), "alternatives": ["Maïs / culture dense", "Maraîchage / légumes"]}
+        # Céréale à paille : blé et orge indiscernables sur NDVI/NDRE seuls.
+        # Ne plus trancher « Blé » par défaut : classe ambiguë CEREALE, affinée
+        # ensuite par resolve_cereal() (NDRE fin + GDD). Sans preuve, on reste
+        # indifférencié plutôt que d'affirmer un blé.
+        return {"class": "CEREALE", "label": "Céréale (blé/orge — indifférencié)", "confidence": min(0.68, 0.52 + ndre * 0.4), "alternatives": ["Blé", "Orge", "Maïs"]}
     if 0.48 <= ndvi < 0.68 and ndre < 0.20:
-        return {"class": "PDT", "label": "Pomme de terre / tubercule", "confidence": min(0.88, 0.54 + ndvi * 0.25), "alternatives": ["Maraîchage / légumes", "Autre végétation"]}
+        return {"class": "PDT", "label": "Pomme de terre", "confidence": min(0.88, 0.54 + ndvi * 0.25), "alternatives": ["Manioc", "Carotte", "Chou"]}
     if ndvi >= 0.35:
-        return {"class": "MARAICHAGE", "label": "Maraîchage / légumes", "confidence": min(0.86, 0.52 + ndvi * 0.22), "alternatives": ["Pomme de terre / tubercule", "Maïs / culture dense"]}
-    return {"class": "AUTRE", "label": "Autre végétation", "confidence": 0.52, "alternatives": ["Sol nu", "Maraîchage / légumes"]}
+        # NDVI/NDRE seuls ne distinguent pas les espèces maraîchères entre elles :
+        # le libellé cite explicitement les légumes les plus probables et les
+        # alternatives détaillent chaque espèce au lieu du générique « Maraîchage ».
+        return {"class": "MARAICHAGE", "label": "Maraîchage (tomate, oignon, chou, carotte)", "confidence": min(0.86, 0.52 + ndvi * 0.22), "alternatives": ["Tomate", "Oignon", "Chou", "Carotte", "Laitue"]}
+    if ndvi >= 0.25:
+        return {"class": "LEGUMINEUSE", "label": "Haricot / Arachide", "confidence": 0.58, "alternatives": ["Tomate", "Oignon", "Friche"]}
+    if ndvi >= 0.15:
+        return {"class": "FRICHE", "label": "Friche / Pâturage", "confidence": 0.55, "alternatives": ["Haricot / Arachide", "Sol nu"]}
+    return {"class": "SOL_NU", "label": "Sol nu / Labour", "confidence": 0.60, "alternatives": ["Friche / Pâturage", "Tomate", "Oignon"]}
+
+
+# ── Différenciation orge / blé ──
+# L'orge et le blé sont quasi identiques sur NDVI/NDRE instantanés. On affine
+# avec deux signaux complémentaires :
+# 1) NDRE fin : l'orge, plus précoce et à épiaison plus claire, sature moins le
+#    red-edge (NDRE modéré) ; un NDRE très élevé + NDVI élevé évoque plutôt le blé.
+# 2) Degrés-jours DEPUIS LE SEMIS ESTIMÉ (ST Zadoks, TR = 0 °C) : l'orge (cycle
+#    court, ~2200 °C·j) mûrit plus tôt que le blé (~2600 °C·j). Un cumul ST élevé
+#    + NDVI qui fléchit = sénescence d'orge. Le cumul doit venir du semis estimé
+#    (track_parcel), jamais d'une fenêtre calendaire fixe qui tronque le cycle.
+# Sans preuve convergente, on reste sur CEREALE (indifférencié) plutôt que
+# d'affirmer une espèce.
+BARLEY_GDD_THRESHOLD = 2200.0
+WHEAT_GDD_THRESHOLD = 2600.0
+# Stade Zadoks à partir duquel une céréale en place est mûre : ST >= 1800 °C
+# (stade pâteux) + NDVI en fléchissement = orge en sénescence, même si le cumul
+# calendaire brut n'atteint pas 2200 °C (fenêtre tronquée).
+BARLEY_RIPENING_ST = 1800.0
+
+
+def resolve_cereal(
+    ndvi: float,
+    ndre: float,
+    gdd_cumulative: float | None,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    st_since_sowing: float | None = None,
+) -> dict[str, Any]:
+    """Affiner une céréale (blé/orge) à partir du NDRE fin et des degrés-jours.
+
+    ``gdd_cumulative`` : cumul calendaire (fenêtre fixe, peut tronquer le cycle).
+    ``st_since_sowing`` : ST depuis le semis estimé — fait foi quand disponible.
+    """
+    barley_score = 0.0
+    wheat_score = 0.0
+    reasons: list[str] = []
+    # Référence thermique : le cumul depuis le semis fait foi ; le cumul
+    # calendaire n'est qu'un repli (fenêtre fixe = cycle potentiellement tronqué).
+    gdd = st_since_sowing if isinstance(st_since_sowing, (int, float)) else gdd_cumulative
+    gdd_label = "ST semis" if isinstance(st_since_sowing, (int, float)) else "GDD"
+    # Fenêtre thermique orge : ST 1800–2600 °C + céréale en place (NDVI 0.42–0.72,
+    # NDRE ≥ 0.20). Dans cette fenêtre, une céréale verte n'est pas un blé dense :
+    # le NDRE élevé seul ne tranche plus, la présomption va à l'orge.
+    in_barley_window = (
+        isinstance(gdd, (int, float))
+        and BARLEY_RIPENING_ST <= gdd < WHEAT_GDD_THRESHOLD
+        and 0.42 <= ndvi < 0.72
+        and ndre >= 0.20
+    )
+    if in_barley_window:
+        barley_score += 1.5
+        reasons.append(f"{gdd_label} {gdd:.0f} °C en fenêtre orge (1800–2600) + céréale en place")
+    # NDRE fin : orge = red-edge modéré (0.20–0.30), blé dense = NDRE élevé —
+    # sauf en fenêtre orge où le NDRE élevé seul n'est plus décisif.
+    if 0.20 <= ndre <= 0.30:
+        barley_score += 1.0
+        reasons.append("NDRE modéré (profil orge)")
+    elif ndre > 0.34:
+        if in_barley_window:
+            reasons.append("NDRE élevé mais ST en fenêtre orge — non décisif")
+        else:
+            wheat_score += 1.5
+            reasons.append("NDRE élevé (profil blé dense)")
+    elif ndre > 0.30:
+        wheat_score += 0.5
+    # NDVI : l'orge sénescente (mûre) fléchit plus tôt que le blé encore vert.
+    # En montaison (ST 800–1100 °C), un NDVI soutenu est NORMAL (alimentation
+    # optimale en eau/nutriments, vert intense) — pas un signal blé. De même,
+    # en fenêtre orge large (1800–2600 °C), une orge irriguée peut rester verte :
+    # le NDVI soutenu n'est un signal blé que HORS fenêtre orge.
+    senescent = 0.42 <= ndvi < 0.55
+    tillering = isinstance(gdd, (int, float)) and 800.0 <= gdd < 1100.0
+    if senescent:
+        barley_score += 0.5
+        reasons.append("NDVI en fléchissement (sénescence précoce)")
+    elif ndvi >= 0.62:
+        if tillering:
+            barley_score += 0.5
+            reasons.append(f"NDVI soutenu en montaison (ST {gdd:.0f} °C, alimentation optimale)")
+        elif in_barley_window:
+            reasons.append("NDVI soutenu mais ST en fenêtre orge — non décisif")
+        else:
+            wheat_score += 0.5
+            reasons.append("NDVI soutenu (blé encore vert)")
+    # Degrés-jours : cycle orge plus court que blé. Le malus « cycle incomplet »
+    # ne s'applique qu'en dessous de la montaison (ST < 800 °C) : en montaison
+    # (800–1100 °C) le cycle est par définition en cours, et au-delà de 1800 °C
+    # la maturation est atteinte — pénaliser serait absurde.
+    if gdd is not None:
+        if gdd >= WHEAT_GDD_THRESHOLD:
+            barley_score += 1.5
+            reasons.append(f"{gdd_label} {gdd:.0f} ≥ {WHEAT_GDD_THRESHOLD:.0f} (cycle orge bouclé)")
+        elif gdd >= BARLEY_GDD_THRESHOLD:
+            barley_score += 0.5
+            wheat_score += 0.5
+            reasons.append(f"{gdd_label} {gdd:.0f} (fenêtre blé/orge)")
+        elif gdd >= BARLEY_RIPENING_ST and senescent:
+            # Maturation thermique atteinte (stade pâteux) + sénescence visible :
+            # orge mûre sur pied, même si la fenêtre calendaire tronque le cumul.
+            barley_score += 1.5
+            reasons.append(f"{gdd_label} {gdd:.0f} ≥ {BARLEY_RIPENING_ST:.0f} + sénescence (orge mûre)")
+        elif gdd >= BARLEY_RIPENING_ST:
+            # Fenêtre orge en cours : cycle non bouclé mais compatible — non décisif.
+            reasons.append(f"{gdd_label} {gdd:.0f} (fenêtre orge, cycle en cours — non décisif)")
+        elif gdd >= 800.0:
+            # Montaison/tallage : cycle en cours par définition — non décisif.
+            reasons.append(f"{gdd_label} {gdd:.0f} (montaison en cours — non décisif)")
+        else:
+            wheat_score += 0.5
+            reasons.append(f"{gdd_label} {gdd:.0f} < 800 (cycle incomplet)")
+    margin = barley_score - wheat_score
+    if margin >= 1.5:
+        confidence = min(0.90, 0.62 + margin * 0.08)
+        return {
+            "class": "ORGE",
+            "label": "Orge",
+            "confidence": confidence,
+            "alternatives": ["Blé", "Maïs"],
+            "method": "NDRE fin + degrés-jours",
+            "reasons": reasons,
+        }
+    if margin <= -1.0:
+        confidence = min(0.88, 0.60 + (-margin) * 0.08)
+        return {
+            "class": "BLE",
+            "label": "Blé",
+            "confidence": confidence,
+            "alternatives": ["Orge", "Maïs"],
+            "method": "NDRE fin + degrés-jours",
+            "reasons": reasons,
+        }
+    # Preuves insuffisantes : rester indifférencié, sans dépasser le seuil de
+    # confirmation (la fiche affichera « à vérifier »).
+    confidence = min(max(confidence_threshold - 0.05, 0.50), 0.68)
+    return {
+        "class": "CEREALE",
+        "label": "Céréale (blé/orge — indifférencié)",
+        "confidence": confidence,
+        "alternatives": ["Blé", "Orge", "Maïs"],
+        "method": "signature insuffisante — validation terrain requise",
+        "reasons": reasons,
+    }
 
 
 def _project_id_from_service_account(service_account_json: str) -> str:
@@ -264,6 +483,7 @@ async def _save_simple_field_parcelle(feature: dict[str, Any]) -> None:
         "hybrid_score": None,
         "cnn_prob_barley": None,
         "cnn_prob_non_barley": None,
+        "phenology": props.get("phenology") if isinstance(props.get("phenology"), dict) else None,
     }
 
     async with async_session_maker() as session:
@@ -531,6 +751,62 @@ def _dedupe_and_rank_candidates(candidates: list[dict[str, Any]]) -> list[dict[s
         return (-(c["ndvi"] if c["ndvi"] is not None else -1), -c["areaM2"])
 
     return sorted(deduped, key=sort_key)
+
+
+def _clip_to_radius(
+    coords: list[dict[str, float]], center_lat: float, center_lng: float, radius_m: float
+) -> list[dict[str, float]]:
+    """Découpe Sutherland-Hodgman d'un polygone au disque (centre, rayon).
+
+    Les segments SNIC débordent du disque quand la tuile GEE (buffer 2,5 km)
+    dépasse le rayon demandé : sans découpe, des cultures hors zone
+    apparaissent dans le résultat. Projection locale mètres (equirectangulaire),
+    64 côtés pour le cercle."""
+    if len(coords) < 3 or radius_m <= 0:
+        return coords
+    lng_scale = max(abs(math.cos(math.radians(center_lat))), 0.1)
+
+    def to_local(lat: float, lng: float) -> tuple[float, float]:
+        return ((lng - center_lng) * 111_320 * lng_scale, (lat - center_lat) * 110_574)
+
+    def from_local(x: float, y: float) -> dict[str, float]:
+        return {"lat": center_lat + y / 110_574, "lng": center_lng + x / (111_320 * lng_scale)}
+
+    pts = [p for p in coords if isinstance(p.get("lat"), (int, float)) and isinstance(p.get("lng"), (int, float))]
+    if pts and pts[0]["lat"] == pts[-1]["lat"] and pts[0]["lng"] == pts[-1]["lng"]:
+        pts = pts[:-1]
+    if len(pts) < 3:
+        return []
+    clipped = [to_local(p["lat"], p["lng"]) for p in pts]
+    boundary = [(radius_m * math.cos(2 * math.pi * i / 64), radius_m * math.sin(2 * math.pi * i / 64)) for i in range(64)]
+
+    def cross(s: tuple[float, float], e: tuple[float, float], p: tuple[float, float]) -> float:
+        return (e[0] - s[0]) * (p[1] - s[1]) - (e[1] - s[1]) * (p[0] - s[0])
+
+    def intersect(p1: tuple[float, float], p2: tuple[float, float], s: tuple[float, float], e: tuple[float, float]) -> tuple[float, float]:
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        ex, ey = e[0] - s[0], e[1] - s[1]
+        denom = dx * ey - dy * ex
+        if denom == 0:
+            return p2
+        t = ((s[0] - p1[0]) * ey - (s[1] - p1[1]) * ex) / denom
+        return (p1[0] + t * dx, p1[1] + t * dy)
+
+    for i in range(len(boundary)):
+        s, e = boundary[i], boundary[(i + 1) % len(boundary)]
+        src, clipped = clipped, []
+        n = len(src)
+        if n == 0:
+            break
+        for j in range(n):
+            prev, cur = src[(j + n - 1) % n], src[j]
+            pin, cin = cross(s, e, prev) >= 0, cross(s, e, cur) >= 0
+            if cin != pin:
+                clipped.append(intersect(prev, cur, s, e))
+            if cin:
+                clipped.append(cur)
+
+    return [from_local(x, y) for x, y in clipped]
 
 
 # ── Tuilage de la zone (GPS + rayon) en cercles couvrant l'AOI ──

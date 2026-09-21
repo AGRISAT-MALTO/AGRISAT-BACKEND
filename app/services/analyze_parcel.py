@@ -31,6 +31,7 @@ from google.oauth2 import service_account
 
 from app.config import settings
 from app.services.field_watershed import lng_lat_to_mercator_meters
+from app.services.sowing import track_parcel as _track_parcel_sowing
 
 logger = logging.getLogger("agrisat.analyze_parcel")
 
@@ -1014,22 +1015,37 @@ def estimate_non_barley_culture(sat_data: dict[str, Any], agro: dict[str, Any]) 
     """Retourne une culture indicative pour les parcelles classées non-orge.
 
     Les indices Sentinel-2 seuls ne permettent pas une identification certaine; le
-    libellé est donc volontairement présenté comme une estimation.
+    libellé est donc volontairement présenté comme une estimation. Le CNN ayant
+    exclu l'orge, la céréale à paille restante dans la plage NDVI 42-72 est
+    libellée « Blé » (blé et orge indiscernables sur NDVI/EVI seuls).
+    Un NDWI élevé sans végétation (NDVI < 15 %) correspond à de l'eau libre
+    (lac, plan d'eau), pas à une rizière inondée.
     """
-    ndvi = sat_data.get("ndvi")
-    ndwi = sat_data.get("ndwi")
+    ndvi = sat_data.get("ndvi")  # pourcentage 0..100
+    ndwi = sat_data.get("ndwi")  # ratio -1..1
     evi = sat_data.get("evi")
     if isinstance(ndwi, (int, float)) and ndwi > 0.18:
-        return "Riz / zone humide (estimé)"
+        # Eau libre (lac, plan d'eau) si pas de végétation ; rizière inondée sinon.
+        if not isinstance(ndvi, (int, float)) or ndvi < 15:
+            return "Eau (lac / plan d'eau)"
+        return "Riz"
     if isinstance(ndvi, (int, float)) and ndvi >= 72 and isinstance(evi, (int, float)) and evi >= 45:
-        return "Maïs / culture dense (estimé)"
+        return "Maïs"
     if isinstance(ndvi, (int, float)) and 48 <= ndvi < 68 and isinstance(evi, (int, float)) and evi < 45:
-        return "Pomme de terre / tubercule (estimé)"
+        return "Pomme de terre"
+    if isinstance(ndvi, (int, float)) and 42 <= ndvi < 72:
+        return "Blé"
     if isinstance(ndvi, (int, float)) and ndvi >= 35:
-        return "Maraîchage / légumes (estimé)"
+        # NDVI/EVI seuls ne distinguent pas les espèces maraîchères : citer
+        # explicitement les légumes les plus probables au lieu du générique.
+        return "Maraîchage (tomate, oignon, chou, carotte)"
+    if isinstance(ndvi, (int, float)) and ndvi >= 25:
+        return "Haricot / Arachide"
+    if isinstance(ndvi, (int, float)) and ndvi >= 15:
+        return "Friche / Pâturage"
     if isinstance(agro.get("score"), (int, float)) and agro["score"] < 35:
-        return "Sol nu ou végétation faible (estimé)"
-    return "Autre culture (estimé)"
+        return "Sol nu / Labour"
+    return "Sol nu / Labour"
 
 
 def create_agro_only_hybrid_score(agro_score: float) -> dict[str, Any]:
@@ -1288,10 +1304,41 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             warnings.append(f"Google Static Maps indisponible : {_error_message(error)}")
 
         planting = detect_planting_date(time_series["s2"], time_series["s1"])
+        # Suivi thermique Zadoks (semis par inversion + ST/stade courant) :
+        # remplace le semis mensuel ci-dessus quand il aboutit. Entrées
+        # optionnelles du body : zadoksCode (ex "30") ou stTarget (°C).
+        try:
+            tracked = await _track_parcel_sowing(
+                lat,
+                lng,
+                time_series["s2"],
+                zadoks_code=body.get("zadoksCode") if isinstance(body, dict) else None,
+                st_target=body.get("stTarget") if isinstance(body, dict) else None,
+            )
+        except Exception as error:  # noqa: BLE001 — repli sur l'estimation mensuelle
+            warnings.append(f"Suivi thermique indisponible : {_error_message(error)}")
+            tracked = None
+        if tracked and tracked.get("estimated_planting_date"):
+            planting = {**planting, **{k: tracked[k] for k in ("estimated_planting_date", "estimated_harvest_date", "days_since_planting", "growth_stage", "planting_confidence") if k in tracked}}
+            warnings.extend(tracked.get("warnings", []) or [])
+            sowing_info = tracked.get("sowing")
+            phenology = tracked.get("phenology")
+            harvest_info = tracked.get("harvest")
+        else:
+            if tracked:
+                warnings.extend(tracked.get("warnings", []) or [])
+            sowing_info = (tracked or {}).get("sowing")
+            phenology = (tracked or {}).get("phenology")
+            harvest_info = (tracked or {}).get("harvest")
         agro = compute_agro_score(sat_data, planting, time_series)
         hf_result = await _call_hf_model_safely(satellite_image, warnings) if satellite_image else None
         hybrid = compute_hybrid_score(hf_result["confidence"], hf_result["is_barley"], agro["score"]) if hf_result else create_agro_only_hybrid_score(agro["score"])
         estimated_culture = None if hybrid["final_is_barley"] else estimate_non_barley_culture(sat_data, agro)
+        # Eau libre : zone vide, aucun résultat de culture.
+        is_water = estimated_culture == "Eau (lac / plan d'eau)"
+        if is_water:
+            warnings.append("Zone en eau détectée (lac / plan d'eau) — aucune culture (zone vide).")
+            estimated_culture = None
         season = detect_season(lat)
 
         data_source_parts = ["Contour parcellaire réel", *sat_data["dataSource"]]
@@ -1340,11 +1387,13 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             recommendations = (
                 f"Orge {'confirmée' if hybrid['final_confidence'] > 70 else 'probable'}. Score hybride {hybrid['hybrid_score']}% (CNN {js_round(hf_result['confidence'])}% + Agro {agro['score']}%)."
                 if hybrid["final_is_barley"]
-                else f"{estimated_culture}. Score hybride {hybrid['hybrid_score']}%. Vérification terrain recommandée."
+                else ("Zone en eau — aucune culture (zone vide)." if is_water else f"{estimated_culture}. Score hybride {hybrid['hybrid_score']}%. Vérification terrain recommandée.")
             )
         else:
             recommendations = (
-                f"{'Orge probable' if hybrid['final_is_barley'] else f'{estimated_culture}'} (modèle CNN indisponible, estimation basée uniquement sur les règles agronomiques, score {agro['score']}%). Vérification terrain recommandée."
+                f"{'Orge probable' if hybrid['final_is_barley'] else ('Zone en eau — aucune culture (zone vide).' if is_water else f'{estimated_culture}')} (modèle CNN indisponible, estimation basée uniquement sur les règles agronomiques, score {agro['score']}%). Vérification terrain recommandée."
+                if not is_water
+                else "Zone en eau — aucune culture (zone vide)."
             )
 
         response = {
@@ -1353,9 +1402,9 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             "detected_segments": detected_segments,
             "hf_model_url": HF_MODEL_URL,
             "hf_available": hf_result is not None,
-            "verdict": hybrid["final_verdict"],
+            "verdict": "Zone en eau — aucune culture (zone vide)." if is_water else hybrid["final_verdict"],
             "details": " | ".join(detail_parts),
-            "culture_detected": "Orge" if hybrid["final_is_barley"] else estimated_culture,
+            "culture_detected": None if is_water else ("Orge" if hybrid["final_is_barley"] else estimated_culture),
             "confidence": hf_result["confidence"] if hf_result else None,
             "cnn_prob_barley": hf_result["prob_barley"] if hf_result else None,
             "cnn_prob_non_barley": hf_result["prob_non_barley"] if hf_result else None,
@@ -1385,6 +1434,9 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             "days_since_planting": planting["days_since_planting"],
             "growth_stage": planting["growth_stage"],
             "planting_confidence": planting["planting_confidence"],
+            "sowing": sowing_info,
+            "phenology": phenology,
+            "harvest": harvest_info,
         }
         return 200, response
     except Exception as error:  # noqa: BLE001

@@ -29,6 +29,7 @@ _PARCELLE_FIELDS = (
     "time_series_s2", "time_series_rain", "estimated_planting_date", "estimated_harvest_date",
     "days_since_planting", "growth_stage", "planting_confidence", "evi", "savi", "ndwi",
     "agro_score", "hybrid_score", "cnn_prob_barley", "cnn_prob_non_barley", "created_at",
+    "phenology",
 )
 
 
@@ -95,6 +96,7 @@ async def create_parcelle(request: Request) -> JSONResponse:
         "hybrid_score": parsed.hybrid_score,
         "cnn_prob_barley": parsed.cnn_prob_barley,
         "cnn_prob_non_barley": parsed.cnn_prob_non_barley,
+        "phenology": parsed.phenology,
     }
 
     async with async_session_maker() as session:

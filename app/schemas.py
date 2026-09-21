@@ -57,6 +57,23 @@ class FieldSegmentationRequest(BaseModel):
     _v = field_validator("threshold")(lambda v: _finite(v) if v is not None else v)
 
 
+class MicroParcelsRequest(BaseModel):
+    """Micro-parcelles : point GPS + rayon (10 m à 5 km, pavé en tuiles HR zoom 19)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    radius: float = Field(default=150, ge=10, le=5_000)
+    sources: dict[str, bool] | None = Field(default=None)
+    confidence_threshold: float | None = Field(default=None, ge=0.5, le=0.95, alias="confidenceThreshold")
+    base_temperature: float | None = Field(default=None, ge=-20, le=30, alias="baseTemperature")
+    threshold: float | None = Field(default=None, ge=2200, le=10_000)
+    period_days: int | None = Field(default=None, ge=1, le=730, alias="periodDays")
+
+    _v_lat = field_validator("latitude", "longitude")(_finite)
+
+
 class ParcelleCreate(BaseModel):
     label: str = Field(max_length=200)
     coordinates: list[Point] = Field(min_length=3)
@@ -111,6 +128,8 @@ class ParcelleCreate(BaseModel):
     cnn_prob_barley: float | None
     cnn_prob_non_barley: float | None
 
+    phenology: dict[str, Any] | None = None
+
 
 class SentinelTileParams(BaseModel):
     z: int = Field(ge=10, le=19)
@@ -156,3 +175,26 @@ class DeleteParcelleParams(BaseModel):
         except ValueError as exc:
             raise ValueError("doit être un UUID valide") from exc
         return v
+
+
+class SowingSeriesPoint(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    date: str = Field(min_length=7, max_length=10)
+    ndvi: float | None = Field(default=None)
+
+
+class SowingDateRequest(BaseModel):
+    """Estimation de la date de semis (orge) par inversion thermique Zadoks."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    observation_date: str | None = Field(default=None, min_length=10, max_length=10, alias="observationDate")
+    zadoks_code: str | None = Field(default=None, min_length=2, max_length=2, alias="zadoksCode")
+    st_target: float | None = Field(default=None, ge=0, le=3000, alias="stTarget")
+    s2: list[SowingSeriesPoint] | None = Field(default=None, max_length=60)
+    history_days: int = Field(default=400, ge=30, le=730, alias="historyDays")
+
+    _v = field_validator("lat", "lng")(_finite)
