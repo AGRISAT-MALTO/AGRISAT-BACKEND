@@ -116,6 +116,13 @@ async def delete_parcelle(parcelle_id: str) -> Response:
         return JSONResponse(status_code=400, content={"error": "Identifiant invalide"})
 
     async with async_session_maker() as session:
+        existing = await session.get(Parcelle, uuid.UUID(parsed.id))
+        if existing is None:
+            return JSONResponse(status_code=404, content={"error": "Parcelle introuvable"})
+
+        if existing.data_source == "Tracé automatique corrigé":
+            return JSONResponse(status_code=409, content={"error": "Cette parcelle corrigée ne peut pas être supprimée."})
+
         result = await session.execute(sa_delete(Parcelle).where(Parcelle.id == uuid.UUID(parsed.id)))
         await session.commit()
         deleted_count = result.rowcount
