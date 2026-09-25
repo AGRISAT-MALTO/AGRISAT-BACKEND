@@ -74,6 +74,10 @@ cp .env.example .env
 | `GEE_SERVICE_ACCOUNT_KEY`          |   **Oui**   | Clé JSON du compte de service Google Earth Engine (indices spectraux, tuiles Sentinel-2)                     |
 | `HF_MODEL_URL`                     |     Non     | URL du modèle hébergé (Hugging Face Space) utilisé en complément de la détection                            |
 | `FIELD_SEGMENTATION_MODEL_URL`     |     Non     | URL du service de segmentation U-Net (`/predict`, `/segment`). En local : `http://localhost:8000`             |
+| `VHR_MODEL_URL`                    |     Non     | URL du service de traçage automatique des parcelles (`serve_vhr.py`). En local : `http://localhost:8010`      |
+| `VHR_SERVICE_DIR`                  |     Non     | Dossier du projet `agri_field_segmentation` : le backend lance alors tout seul le service de traçage au démarrage (si `/health` ne répond pas). Vide : démarrage manuel |
+| `VHR_SERVICE_PYTHON`               |     Non     | Python utilisé pour l'auto-start (défaut : venv du service s'il existe, sinon le Python du backend)           |
+| `VHR_SERVICE_PORT`                 |     Non     | Port de l'auto-start du service de traçage (défaut : `8010`)                                                  |
 | `GOOGLE_MAPS_API_KEY`              |     Non     | Clé Google Maps côté serveur (si utilisée pour des appels backend)                                            |
 | `AIRBUS_ONEATLAS_API_KEY`          |     Non     | Clé API Airbus OneAtlas (imagerie haute résolution)                                                           |
 | `PLANET_API_KEY`                   |     Non     | Clé API Planet (mosaïques/tuiles), active les routes `/api/planet/*`                                          |

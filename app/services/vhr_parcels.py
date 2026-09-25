@@ -34,6 +34,10 @@ Rayon plafonne a 1 km.
 Cache : le frontend trace l'ecran en zones fixes (centres toujours identiques),
 chaque zone est donc gardee sur disque et resservie instantanement a la visite
 suivante. Deux requetes simultanees sur la meme zone ne lancent qu'un tracage.
+Le cache est versionne (VHR_CACHE_VERSION) : monter la version invalide les
+traces produits par un ancien modele (ex. passage de delineate_jecam.pt a
+delineate_jecam_complet.pt) — les zones seront retracees a la demande.
+Relancer ensuite precalcul_malto.py pour re-precaculer le mode mix.
 
 Licences : Delineate Anything est sous AGPL-3.0 ; les images Esri World Imagery
 et Wayback sont soumises aux conditions d'Esri. A verifier avant toute mise en
@@ -65,6 +69,10 @@ TIMEOUT_S = {"simple": 300.0, "mix": 1_800.0}
 TRANCHES = [(0, 0.1, "< 0,1 ha"), (0.1, 0.5, "0,1-0,5 ha"),
             (0.5, 1.0, "0,5-1 ha"), (1.0, math.inf, "> 1 ha")]
 
+# Version du format de cache : a incrementer quand le modele de tracage change
+# (serve_vhr.py POIDS), pour ne plus servir les traces de l'ancien modele.
+VHR_CACHE_VERSION = 2
+
 AVERTISSEMENT_FIABILITE = {
     "simple": (
         "Contours traces automatiquement sur image a ~1,2 m : fiables au-dessus de 0,5 ha "
@@ -94,9 +102,11 @@ def _cache_dir() -> Path:
 
 
 def _cache_path(latitude: float, longitude: float, radius_m: float, mode: str = "simple") -> Path:
-    # Mode simple : nom historique, sans suffixe, pour garder les zones deja en cache.
+    # Suffixe de version : les fichiers des versions precedentes (suffixe "_v1"
+    # implicite : mode simple sans suffixe) ne sont plus lus ni ecrits.
     suffixe = "" if mode == "simple" else f"_{mode}"
-    return _cache_dir() / f"{latitude:.5f}_{longitude:.5f}_{round(radius_m)}{suffixe}.json"
+    return (_cache_dir() /
+            f"{latitude:.5f}_{longitude:.5f}_{round(radius_m)}_v{VHR_CACHE_VERSION}{suffixe}.json")
 
 
 def _read_cache(path: Path) -> dict[str, Any] | None:

@@ -92,10 +92,10 @@ FIELD_MODEL_SCALE_M = 10
 FIELD_MODEL_REGION_RADIUS_KM = 2
 MAX_FIELD_MODEL_RADIUS_KM = 1.2
 FIELD_MODEL_MONTHS = ["03", "04", "05", "06", "07", "08"]
-FIELD_MODEL_CLOUD_LIMIT = 35
+FIELD_MODEL_CLOUD_LIMIT = 15
 FIELD_MODEL_GEE_CONCURRENCY = 3
-FIELD_MODEL_MIN_SEGMENT_AREA_M2 = 1_000
-FIELD_MODEL_MAX_SEGMENT_AREA_M2 = 800_000
+FIELD_MODEL_MIN_SEGMENT_AREA_M2 = 1_500
+FIELD_MODEL_MAX_SEGMENT_AREA_M2 = 600_000
 FIELD_MODEL_REQUEST_TIMEOUT_S = 30.0
 
 
@@ -643,15 +643,70 @@ def _polygon_perimeter_m(coords: list[dict[str, float]]) -> float:
     return perimeter
 
 
-MIN_FIELD_COMPACTNESS = 0.12
+MIN_FIELD_COMPACTNESS = 0.35
+MIN_FIELD_HULL_RATIO = 0.8
+MAX_FIELD_ASPECT_RATIO = 12.0
 
 
 def _is_plausible_field_shape(coords: list[dict[str, float]], area_m2: float) -> bool:
+    if len(coords) < 3 or area_m2 <= 0:
+        return False
+
     perimeter_m = _polygon_perimeter_m(coords)
     if perimeter_m <= 0:
         return False
-    compactness = (4 * math.pi * area_m2) / (perimeter_m * perimeter_m)
-    return compactness >= MIN_FIELD_COMPACTNESS
+
+    centroid = _polygon_center(coords)
+    lat_factor = 111_320
+    lng_factor = 111_320 * math.cos((centroid["lat"] * math.pi) / 180)
+    metric_points = [
+        ((point["lng"] - centroid["lng"]) * lng_factor, (point["lat"] - centroid["lat"]) * lat_factor)
+        for point in coords
+    ]
+    metric_area_m2 = 0.0
+    for index, point in enumerate(metric_points):
+        next_point = metric_points[(index + 1) % len(metric_points)]
+        metric_area_m2 += point[0] * next_point[1] - next_point[0] * point[1]
+    metric_area_m2 = abs(metric_area_m2) / 2
+    if metric_area_m2 <= 0:
+        return False
+
+    compactness = (4 * math.pi * metric_area_m2) / (perimeter_m * perimeter_m)
+    if compactness < MIN_FIELD_COMPACTNESS:
+        return False
+
+    try:
+        from shapely.geometry import Polygon as ShapelyPolygon
+
+        polygon = ShapelyPolygon([(point["lng"], point["lat"]) for point in coords])
+        if polygon.is_empty or polygon.area <= 0:
+            return False
+        hull_ratio = polygon.area / polygon.convex_hull.area if polygon.convex_hull.area > 0 else 0.0
+        if hull_ratio < MIN_FIELD_HULL_RATIO:
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+
+    lats = [point["lat"] for point in coords]
+    lngs = [point["lng"] for point in coords]
+    lat_span = max(lats) - min(lats)
+    lng_span = max(lngs) - min(lngs)
+    if lat_span <= 0 or lng_span <= 0:
+        return False
+
+    latitude_scale = max(abs(math.cos((sum(lats) / len(lats)) * math.pi / 180)), 0.1)
+    width_m = lng_span * 111_320 * latitude_scale
+    height_m = lat_span * 110_574
+    if width_m <= 0 or height_m <= 0:
+        return False
+
+    long_side = max(width_m, height_m)
+    short_side = min(width_m, height_m)
+    if short_side <= 0:
+        return False
+
+    aspect_ratio = long_side / short_side
+    return aspect_ratio <= MAX_FIELD_ASPECT_RATIO
 
 
 def _offset_point(center: dict[str, float], east_km: float, north_km: float) -> dict[str, float]:
