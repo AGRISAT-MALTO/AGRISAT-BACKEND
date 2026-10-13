@@ -3,4 +3,13 @@ __pycache__/
 *.pyc
 *.egg-info/
 .env
+.env.*
+!.env.example
 *.log
+
+# Local model response cache (may contain large/generated data)
+.cache/
+
+# Large parcel datasets kept local
+app/data/parcelles_ftw.parquet
+app/data/parcelles_antsirabe.geojson

@@ -6,6 +6,7 @@ from app.routes import (
     detect_parcels,
     field_segmentation,
     health,
+    modeles,
     parcelles,
     planet,
     sentinel_tiles,
@@ -16,6 +17,8 @@ from app.routes import (
 
 api_router = APIRouter()
 api_router.include_router(health.router)
+api_router.include_router(modeles.router)
+
 api_router.include_router(planet.router)
 api_router.include_router(parcelles.router)
 api_router.include_router(analyze_parcel.router)
