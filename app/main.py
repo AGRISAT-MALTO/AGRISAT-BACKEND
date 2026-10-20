@@ -24,7 +24,10 @@ async def lifespan(app: FastAPI):
         try:
             await cache.load_parcelles()
         except Exception as error:  # noqa: BLE001
-            logger.warning("parcelles: préchauffage initial échoué, réessai à la première requête: %s", error)
+            logger.warning(
+                "parcelles: préchauffage initial échoué, réessai à la première requête: %s",
+                cache.describe_error(error),
+            )
 
     asyncio.ensure_future(_warmup())
 

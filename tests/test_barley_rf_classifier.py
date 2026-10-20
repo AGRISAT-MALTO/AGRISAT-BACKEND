@@ -1,3 +1,4 @@
+import json
 import math
 
 import pandas as pd
@@ -80,6 +81,20 @@ def test_cloudy_month_is_tolerated():
 def test_empty_series_returns_none():
     assert classify([]) is None
     assert build_features([]) is None
+
+
+def test_model_artifacts_are_valid_json():
+    """metrics.json et threshold_selection.json alimentent /api/modeles : validés ici, pas au démarrage."""
+    from app.services.barley_rf_classifier import METRICS_PATH, THRESHOLD_PATH, load_model
+
+    for path in (METRICS_PATH, THRESHOLD_PATH):
+        json.loads(path.read_text(encoding="utf-8"))
+
+    bundle = load_model()
+
+    assert bundle is not None
+    assert bundle["metrics"].get("generated_at")
+    assert bundle["threshold"] == pytest.approx(0.3268)
 
 
 def test_three_level_verdict():

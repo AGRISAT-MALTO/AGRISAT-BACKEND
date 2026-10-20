@@ -21,6 +21,13 @@ _cache: dict | None = None  # {"expires_at": float, "rows": list[Parcelle]}
 _inflight_request: asyncio.Task | None = None
 
 
+def describe_error(error: BaseException) -> str:
+    """Message exploitable dans les logs : asyncio.TimeoutError a une str() vide."""
+    if isinstance(error, asyncio.TimeoutError):
+        return f"délai de requête dépassé ({PARCELLES_QUERY_TIMEOUT_S:.0f} s)"
+    return str(error) or type(error).__name__
+
+
 async def _fetch_parcelles_rows() -> list[Parcelle]:
     async with async_session_maker() as session:
         result = await session.execute(select(Parcelle).order_by(Parcelle.created_at.desc()))
@@ -48,7 +55,7 @@ def _refresh_in_background() -> None:
         try:
             await _fetch_parcelles()
         except Exception as error:  # noqa: BLE001
-            logger.warning("parcelles: background refresh failed, keeping stale cache: %s", error)
+            logger.warning("parcelles: background refresh failed, keeping stale cache: %s", describe_error(error))
 
     asyncio.ensure_future(_run())
 
