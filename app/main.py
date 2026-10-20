@@ -4,18 +4,33 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app import cache
 from app.config import settings
+from app.db import engine
 from app.errors import register_error_handlers
 from app.services.vhr_launcher import ensure_vhr_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agrisat")
+server_logger = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        async with asyncio.timeout(20):
+            async with engine.connect() as connection:
+                await connection.execute(text("SELECT 1"))
+    except TimeoutError:
+        server_logger.error("Connexion à la base de données échouée : délai dépassé après 20 secondes.")
+    except SQLAlchemyError as error:
+        server_logger.error("Connexion à la base de données échouée : %s", error)
+    else:
+        server_logger.info("Connexion à la base de données établie.")
+
     # Préchauffage non bloquant du cache parcelles au démarrage (miroir du bas de
     # server.ts : loadParcelles().catch(...) après app.listen()).
     async def _warmup() -> None:

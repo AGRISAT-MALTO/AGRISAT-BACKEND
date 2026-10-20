@@ -60,7 +60,7 @@ pip install -e .
 
 ## Configuration
 
-Copiez le modèle fourni puis renseignez vos propres valeurs :
+Copiez le modèle fourni puis renseignez vos propres valeurs. Remplacez la valeur d'exemple de `DATABASE_URL` par l'URL PostgreSQL complète fournie par votre hébergeur (par exemple Neon) :
 
 ```bash
 cp .env.example .env
