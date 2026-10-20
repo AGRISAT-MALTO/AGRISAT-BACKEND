@@ -7,7 +7,15 @@ class Settings(BaseSettings):
     database_url: str = ""
     gee_service_account_key: str = "{}"
     hf_model_url: str = ""
-    field_segmentation_model_url: str = "http://localhost:8000"
+    # Poids YOLO de segmentation de parcelles embarqué (vide : app/data/models/field_segmentation).
+    # Le modèle est exécuté dans le processus backend, sans API ni service séparé.
+    field_segmentation_model_path: str = ""
+    # Seuil du masque quand la requête n'en fournit pas. 0,1 = confiance de production
+    # du projet source : au-delà, le masque devient quasi vide (confiances médianes ~0,2).
+    field_segmentation_threshold: float = 0.1
+    # Préchauffage des modèles au démarrage (import torch + premier passage).
+    # Passer à false en développement pour ne pas payer ~20 s à chaque --reload.
+    warmup_models: bool = True
     vhr_model_url: str = "http://localhost:8010"
     # Auto-start du service de tracage VHR (serve_vhr.py, modele delineate_jecam_complet.pt).
     # vhr_service_dir vide : pas d'auto-start (le service doit etre lance a la main).

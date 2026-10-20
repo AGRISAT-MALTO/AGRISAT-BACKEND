@@ -12,7 +12,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.35,<2.1",
     "asyncpg>=0.30,<0.31",
     "alembic>=1.13,<2",
-    "httpx>=0.27,<0.28",
+    "httpx>=0.27,<0.29",  # 0.28 requis par ultralytics-platform (modèle de segmentation embarqué)
     "google-auth>=2.35,<3",
     "requests>=2.32,<3",  # transport requis par google.auth.transport.requests.Request (credentials.refresh)
     "numpy>=1.26,<3",
@@ -20,7 +20,10 @@ dependencies = [
     "pyarrow>=15",  # lecture par blocs du GeoParquet Fields of The World (app/services/zone_parcels.py)
     "pandas>=2.2,<3",  # construction des features du classifieur RF orge (app/services/barley_rf_classifier.py)
     "scikit-learn>=1.5,<1.10",  # pipeline du modèle RF orge (joblib) — même version que l'entraînement (1.9.x)
-    "joblib>=1.3,<2",  # chargement de app/data/models/rf_orge/final_orge_model.pkl
+    "joblib>=1.3,<2",  # chargement de app/data/models/orge_rf/orge_rf.joblib
+    "pillow>=10,<12",  # décodage des images de /api/field-segmentation
+    "torch>=2.0,<3",  # inférence locale du modèle YOLO de segmentation (CPU ou GPU)
+    "ultralytics>=8.3,<9",  # chargement et exécution de parcel_segmentation_yolo.pt
 ]
 
 [project.optional-dependencies]

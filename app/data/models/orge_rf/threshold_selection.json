@@ -1,0 +1,99 @@
+{
+  "generated_at": "2026-10-19 21:59:29",
+  "objectif": {
+    "rappel_cible_parcelle": 0.85,
+    "niveau": "parcelle (proba moyenne des dates)"
+  },
+  "evaluation": "GroupKFold(5) par parcelle, predictions hors-echantillon",
+  "auc_roc_observation": 0.822947,
+  "validation_imbriquee": {
+    "plis": [
+      {
+        "pli": 0,
+        "seuil_choisi_hors_pli": 0.3322,
+        "seuil": 0.3322,
+        "n_parcelles_orge": 29,
+        "detectees": 42,
+        "vraies_orge_detectees": 23,
+        "orge_manquees": 6,
+        "fausses_alarmes": 19,
+        "rappel_orge": 0.793103,
+        "precision_orge": 0.547619
+      },
+      {
+        "pli": 1,
+        "seuil_choisi_hors_pli": 0.4004,
+        "seuil": 0.4004,
+        "n_parcelles_orge": 46,
+        "detectees": 40,
+        "vraies_orge_detectees": 30,
+        "orge_manquees": 16,
+        "fausses_alarmes": 10,
+        "rappel_orge": 0.652174,
+        "precision_orge": 0.75
+      },
+      {
+        "pli": 2,
+        "seuil_choisi_hors_pli": 0.2313,
+        "seuil": 0.2313,
+        "n_parcelles_orge": 29,
+        "detectees": 53,
+        "vraies_orge_detectees": 27,
+        "orge_manquees": 2,
+        "fausses_alarmes": 26,
+        "rappel_orge": 0.931034,
+        "precision_orge": 0.509434
+      },
+      {
+        "pli": 3,
+        "seuil_choisi_hors_pli": 0.2679,
+        "seuil": 0.2679,
+        "n_parcelles_orge": 38,
+        "detectees": 49,
+        "vraies_orge_detectees": 34,
+        "orge_manquees": 4,
+        "fausses_alarmes": 15,
+        "rappel_orge": 0.894737,
+        "precision_orge": 0.693878
+      },
+      {
+        "pli": 4,
+        "seuil_choisi_hors_pli": 0.2148,
+        "seuil": 0.2148,
+        "n_parcelles_orge": 39,
+        "detectees": 55,
+        "vraies_orge_detectees": 37,
+        "orge_manquees": 2,
+        "fausses_alarmes": 18,
+        "rappel_orge": 0.948718,
+        "precision_orge": 0.672727
+      }
+    ],
+    "rappel_orge": 0.834254,
+    "precision_orge": 0.631799
+  },
+  "seuil_retenu": 0.3268,
+  "point_de_fonctionnement": {
+    "seuil": 0.3268,
+    "n_parcelles_orge": 181,
+    "detectees": 235,
+    "vraies_orge_detectees": 154,
+    "orge_manquees": 27,
+    "fausses_alarmes": 81,
+    "rappel_orge": 0.850829,
+    "precision_orge": 0.655319
+  },
+  "seuil_precedent": 0.35999999999999993,
+  "point_de_fonctionnement_precedent": {
+    "seuil": 0.36,
+    "n_parcelles_orge": 181,
+    "detectees": 223,
+    "vraies_orge_detectees": 150,
+    "orge_manquees": 31,
+    "fausses_alarmes": 73,
+    "rappel_orge": 0.828729,
+    "precision_orge": 0.672646
+  },
+  "applique": true,
+  "sauvegarde": "orge_rf_backup_20261019_215929.joblib"
+}
