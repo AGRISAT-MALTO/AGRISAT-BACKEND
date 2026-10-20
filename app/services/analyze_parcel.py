@@ -1,9 +1,16 @@
 """Port 1:1 de src/analyze-parcel.ts : analyse détaillée d'une parcelle (indices
-spectraux GEE, séries temporelles, SNIC, classification CNN HuggingFace, scoring
+spectraux GEE, séries temporelles, classification CNN HuggingFace, scoring
 agro/hybride, détection de date de plantation) — et, en même temps, le client REST
 Google Earth Engine partagé par automatic_parcels.py, barley_detect_simple.py,
 zoning.py et app/routes/sentinel_tiles.py (mêmes primitives : auth, gee_call/
 gee_constant, add_spectral_index, capture d'images, fetch_with_retry).
+
+Verdict orge / non-orge, par ordre de priorité :
+1. Classifieur RF saisonnier (barley_rf_classifier.py, modèle entraîné hors-ligne
+   sur 12 mois de série Sentinel-2) ;
+2. Classifieur Sentinel-2 calibré sur le terrain (barley_s2_classifier.py) ;
+3. Repli : ancienne fusion CNN (modèle HF andritonny, conservé) + score agro.
+Le CNN et le score agro restent calculés à titre indicatif dans tous les cas.
 
 Fidélité : les formules d'indices spectraux, le scoring agro/hybride, la
 détection de date de plantation et les arbres d'expression GEE sont portés
@@ -30,18 +37,18 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 
 from app.config import settings
+from app.services.barley_rf_classifier import classify as classify_barley_rf
+from app.services.barley_s2_classifier import classify as classify_barley_s2
+from app.services.barley_rf_classifier import load_model as load_barley_rf
 from app.services.field_watershed import lng_lat_to_mercator_meters
+# s2_time_series importe les primitives GEE de ce module : import paresseux dans
+# analyze_parcel() pour éviter l'import circulaire (comme zoning.py / automatic_parcels.py).
 
 logger = logging.getLogger("agrisat.analyze_parcel")
 
 HF_MODEL_URL = settings.hf_model_url or "https://andritinatonny-agrisat.hf.space"
 GOOGLE_MAPS_API_KEY = settings.google_maps_api_key
 
-SNIC_PARAMETERS = {"size": 15, "compactness": 0.75, "connectivity": 8, "neighborhoodSize": 60, "scale": 10}
-MIN_SEGMENT_AREA_M2 = 2_500
-MAX_SEGMENT_AREA_M2 = 500_000
-MAX_SEGMENTS_TO_CLASSIFY = 12
-SEGMENT_CLASSIFY_CONCURRENCY = 3
 MIN_BARLEY_CONFIDENCE = 70
 TIME_SERIES_CONCURRENCY = 1
 GEE_COMPUTE_TIMEOUT_S = 60.0
@@ -1041,158 +1048,130 @@ def detect_season(lat: float) -> str:
     return "Jachère"  # septembre
 
 
-# ── SNIC barley segment detection ──
+# ── Contour d'orge = la parcelle analysée, entière ──
 
 
-def _feature_number(properties: dict[str, Any], names: list[str]) -> float | None:
-    for name in names:
-        value = properties.get(name)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-            return value
-    return None
-
-
-def _to_segment_candidates(feature: Any) -> list[dict[str, Any]]:
-    if not isinstance(feature, dict):
+def _parcel_as_barley_segment(polygon: list[LatLng], hf_result: dict[str, Any] | None, ndvi_percentage: float | None) -> list[dict[str, Any]]:
+    """La parcelle analysée (déjà tracée, dessinée ou référencée) est classée entière, sans
+    découpage en sous-segments : si le CNN y reconnaît de l'orge avec assez de confiance,
+    son contour devient le contour d'orge affiché."""
+    if not hf_result or not hf_result["is_barley"] or hf_result["confidence"] < MIN_BARLEY_CONFIDENCE:
         return []
-    coordinates = extract_latlng_from_geometry(feature.get("geometry"))
-    if len(coordinates) < 3:
-        return []
-
-    area_m2 = approximate_polygon_area_m2(coordinates)
-    if area_m2 < MIN_SEGMENT_AREA_M2 or area_m2 > MAX_SEGMENT_AREA_M2:
-        return []
-
-    properties = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
-    ndvi = _feature_number(properties, ["NDVI", "NDVI_mean", "ndvi", "ndvi_mean"])
-    ndwi = _feature_number(properties, ["NDWI", "NDWI_mean", "ndwi", "ndwi_mean"])
-    ndbi = _feature_number(properties, ["NDBI", "NDBI_mean", "ndbi", "ndbi_mean"])
-
-    if (ndvi is not None and ndvi < 0.2) or (ndwi is not None and ndwi > 0.1) or (ndbi is not None and ndbi > 0.05):
-        return []
-
-    return [{"coordinates": coordinates, "areaM2": area_m2, "ndvi": ndvi}]
-
-
-def _build_snic_vectors_expression(polygon: Any) -> dict:
-    end_date = datetime.now(timezone.utc).date().isoformat()
-    start_date = (datetime.now(timezone.utc) - timedelta(days=90)).date().isoformat()
-    values: dict[str, GeeValue] = {}
-
-    def reference(name: str) -> GeeValue:
-        return {"valueReference": name}
-
-    values["region"] = gee_call("GeometryConstructors.Polygon", {"coordinates": gee_constant(polygon_coordinates(polygon))})
-    values["intersectsRegion"] = gee_call("Filter.intersects", {"leftField": gee_constant(".all"), "rightValue": gee_call("Feature", {"geometry": reference("region")})})
-    values["dateRange"] = gee_call("Filter.dateRangeContains", {"leftValue": gee_call("DateRange", {"start": gee_constant(start_date), "end": gee_constant(end_date)}), "rightField": gee_constant("system:time_start")})
-    values["lowCloudCover"] = gee_call("Filter.lessThan", {"leftField": gee_constant("CLOUDY_PIXEL_PERCENTAGE"), "rightValue": gee_constant(35)})
-    values["collectionByRegion"] = gee_call("Collection.filter", {"collection": gee_call("ImageCollection.load", {"id": gee_constant("COPERNICUS/S2_SR_HARMONIZED")}), "filter": reference("intersectsRegion")})
-    values["collectionByDate"] = gee_call("Collection.filter", {"collection": reference("collectionByRegion"), "filter": reference("dateRange")})
-    values["collection"] = gee_call("Collection.filter", {"collection": reference("collectionByDate"), "filter": reference("lowCloudCover")})
-    values["composite"] = gee_call("reduce.median", {"collection": reference("collection")})
-    values["spectralImage"] = gee_call("Image.select", {"input": reference("composite"), "bandSelectors": gee_constant(["B2", "B3", "B4", "B8", "B11", "B12"])})
-    values["withNdvi"] = add_spectral_index(reference("spectralImage"), "NDVI", ("B8", "B4"))
-    values["withNdwi"] = add_spectral_index(reference("withNdvi"), "NDWI", ("B3", "B8"))
-    values["withNdbi"] = add_spectral_index(reference("withNdwi"), "NDBI", ("B11", "B8"))
-    values["segmentationImage"] = add_bare_soil_index(reference("withNdbi"))
-
-    def image_band(name: str) -> GeeValue:
-        return gee_call("Image.select", {"input": reference("segmentationImage"), "bandSelectors": gee_constant([name])})
-
-    values["ndviMask"] = gee_call("Image.gt", {"image1": image_band("NDVI"), "image2": gee_image_constant(0.2)})
-    values["waterMask"] = gee_call("Image.lt", {"image1": image_band("NDWI"), "image2": gee_image_constant(0.1)})
-    values["urbanMask"] = gee_call("Image.lt", {"image1": image_band("NDBI"), "image2": gee_image_constant(0.05)})
-    values["bareSoilMask"] = gee_call("Image.lt", {"image1": image_band("BSI"), "image2": gee_image_constant(0.2)})
-    values["vegetationMask"] = gee_call(
-        "Image.and",
+    return [
         {
-            "image1": gee_call("Image.and", {"image1": gee_call("Image.and", {"image1": reference("ndviMask"), "image2": reference("waterMask")}), "image2": reference("urbanMask")}),
-            "image2": reference("bareSoilMask"),
-        },
-    )
-    values["maskedImage"] = gee_call("Image.updateMask", {"image": reference("segmentationImage"), "mask": reference("vegetationMask")})
-    values["vegetationImage"] = gee_call("Image.clip", {"input": reference("maskedImage"), "geometry": reference("region")})
-    values["snic"] = gee_call(
-        "Image.Segmentation.SNIC",
-        {
-            "image": reference("vegetationImage"),
-            "size": gee_constant(SNIC_PARAMETERS["size"]),
-            "compactness": gee_constant(SNIC_PARAMETERS["compactness"]),
-            "connectivity": gee_constant(SNIC_PARAMETERS["connectivity"]),
-            "neighborhoodSize": gee_constant(SNIC_PARAMETERS["neighborhoodSize"]),
-        },
-    )
-    values["snicClusters"] = gee_call("Image.select", {"input": reference("snic"), "bandSelectors": gee_constant(["clusters"])})
-    values["vectorsImage"] = gee_call("Image.addBands", {"dstImg": reference("snicClusters"), "srcImg": reference("vegetationImage")})
-    values["vectors"] = gee_call(
-        "Image.reduceToVectors",
-        {
-            "image": reference("vectorsImage"),
-            "reducer": gee_call("Reducer.mean", {}),
-            "geometry": reference("region"),
-            "scale": gee_constant(SNIC_PARAMETERS["scale"]),
-            "geometryType": gee_constant("polygon"),
-            "eightConnected": gee_constant(True),
-            "labelProperty": gee_constant("segment_id"),
-            "bestEffort": gee_constant(True),
-            "maxPixels": gee_constant(10_000_000),
-            "tileScale": gee_constant(2),
-        },
+            "coordinates": polygon,
+            "confidence": js_round(hf_result["confidence"]),
+            "ndvi": ndvi_percentage / 100 if ndvi_percentage is not None else None,
+            "area_ha": js_round((approximate_polygon_area_m2(polygon) / 10_000) * 100) / 100,
+        }
+    ]
+
+
+# ── Verdict par le classifieur RF saisonnier (app/services/barley_rf_classifier.py) ──
+
+RF_CLASSIFIER_SOURCE = "Classifieur orge RF (série Sentinel-2 annuelle)"
+
+
+def rf_calibration_note() -> str:
+    """Provenance du modèle RF (métadonnées du ré-entraînement, modèle_orge/training)."""
+    model = load_barley_rf()
+    if model is None:
+        return ""
+    metrics = (model.get("summary") or {}).get("final_metrics") or {}
+    f1 = metrics.get("f1_orge")
+    auc = metrics.get("roc_auc")
+    parts = []
+    if f1 is not None:
+        parts.append(f"F1 orge {js_round(f1 * 100)}%")
+    if auc is not None:
+        parts.append(f"AUC {auc:.2f}")
+    detail = ", ".join(parts)
+    return (
+        f"Random Forest sur la dynamique saisonnière Sentinel-2 (12 mois, 48 caractéristiques"
+        f"{', ' + detail if detail else ''}) : à confirmer sur le terrain hors des zones d'entraînement."
     )
 
-    return {"expression": {"result": "vectors", "values": values}}
+
+def verdict_from_rf(rf: dict[str, Any]) -> dict[str, Any]:
+    """Même forme que verdict_from_s2, pour le reste de l'analyse et l'enregistrement.
+    hybrid_score porte la probabilité d'orge du RF saisonnier."""
+    probability = rf["probability"]
+    pct = js_round(probability * 100)
+    verdict = (
+        f"✅ ORGE CONFIRMÉE — RF Sentinel-2 (probabilité d'orge {pct}%)"
+        if rf["is_barley"]
+        else f"❌ NON-ORGE — RF Sentinel-2 (probabilité d'orge {pct}%)"
+    )
+    return {
+        "hybrid_score": pct,
+        "final_is_barley": rf["is_barley"],
+        "final_verdict": verdict,
+        "final_confidence": js_round(max(probability, 1 - probability) * 100),
+    }
 
 
-async def _detect_barley_segments(
-    access_token: str, project_id: str, polygon: Any, fallback_zoom: int, warnings: list[str]
-) -> list[dict[str, Any]]:
-    try:
-        logger.info("[SNIC] Segmentation démarrée")
-        raw = await call_gee_compute_raw(access_token, project_id, _build_snic_vectors_expression(polygon))
-        result = raw.get("result")
-        if not is_gee_feature_collection(result):
-            logger.warning("[SNIC] Aucune image Sentinel-2 exploitable ou aucun objet vectorisé.")
-            return []
-
-        logger.info("[SNIC] Image Sentinel-2 récupérée")
-        logger.info("[SNIC] Nombre d'objets détectés : %s", len(result["features"]))
-
-        candidates: list[dict[str, Any]] = []
-        for feature in result["features"]:
-            candidates.extend(_to_segment_candidates(feature))
-        candidates.sort(key=lambda c: (-(c["ndvi"] if c["ndvi"] is not None else -1), -c["areaM2"]))
-        candidates = candidates[:MAX_SEGMENTS_TO_CLASSIFY]
-
-        logger.info("[CLASSIFICATION] Objets envoyés au modèle : %s", len(candidates))
-
-        async def classify(candidate: dict[str, Any]) -> dict[str, Any] | None:
-            try:
-                center = polygon_centroid(candidate["coordinates"])
-                thumbnail = await capture_parcel_image(
-                    center["lat"], center["lng"], segment_zoom_for_area(candidate["areaM2"], center["lat"], fallback_zoom), candidate["coordinates"]
-                )
-                classification = await call_hf_model(thumbnail)
-                if classification["is_barley"] and classification["confidence"] >= MIN_BARLEY_CONFIDENCE:
-                    return {
-                        "coordinates": candidate["coordinates"],
-                        "confidence": js_round(classification["confidence"]),
-                        "ndvi": candidate["ndvi"],
-                        "area_ha": js_round((candidate["areaM2"] / 10_000) * 100) / 100,
-                    }
-                return None
-            except Exception as error:  # noqa: BLE001
-                logger.warning("[CLASSIFICATION] Échec de la classification d'un objet : %s", error)
-                return None
-
-        classified = await map_with_concurrency(candidates, SEGMENT_CLASSIFY_CONCURRENCY, classify)
-        barley_segments = [s for s in classified if s is not None]
-
-        logger.info("[CLASSIFICATION] Orge détectée : %s", len(barley_segments))
-        return barley_segments
-    except Exception as error:  # noqa: BLE001
-        warnings.append(f"SNIC indisponible : {_error_message(error)}")
-        logger.warning("[SNIC] Échec de la segmentation : %s", error)
+def _rf_barley_segment(polygon: list[LatLng], rf: dict[str, Any], ndvi_percentage: float | None) -> list[dict[str, Any]]:
+    """La parcelle entière devient contour d'orge si le RF saisonnier y conclut."""
+    if not rf["is_barley"]:
         return []
+    return [
+        {
+            "coordinates": polygon,
+            "confidence": js_round(rf["probability"] * 100),
+            "ndvi": ndvi_percentage / 100 if ndvi_percentage is not None else None,
+            "area_ha": js_round((approximate_polygon_area_m2(polygon) / 10_000) * 100) / 100,
+        }
+    ]
+
+
+# ── Verdict par le classifieur Sentinel-2 (app/services/barley_s2_classifier.py) ──
+
+# Repère, dans data_source, les analyses dont hybrid_score porte la probabilité d'orge
+# Sentinel-2 (et non plus 0,6 × CNN + 0,4 × agro) : le frontend adapte son libellé.
+S2_CLASSIFIER_SOURCE = "Classifieur orge Sentinel-2"
+
+
+def s2_calibration_note(s2: dict[str, Any]) -> str:
+    cal = s2.get("calibration") or {}
+    if not cal:
+        return "Vérification terrain recommandée."
+    return (
+        f"Modèle calibré sur {cal.get('n_parcels')} parcelles terrain ({', '.join(cal.get('sources', []))}, "
+        f"{cal.get('date')}), exactitude estimée {js_round((cal.get('loo_accuracy') or 0) * 100)}% : "
+        "à confirmer sur le terrain hors de cette zone et de cette période."
+    )
+
+
+def verdict_from_s2(s2: dict[str, Any]) -> dict[str, Any]:
+    """Même forme que compute_hybrid_score, pour le reste de l'analyse et l'enregistrement.
+    hybrid_score porte désormais la probabilité d'orge Sentinel-2."""
+    probability = s2["probability"]
+    pct = js_round(probability * 100)
+    verdict = (
+        f"✅ ORGE CONFIRMÉE — Sentinel-2 (probabilité d'orge {pct}%)"
+        if s2["is_barley"]
+        else f"❌ NON-ORGE — Sentinel-2 (probabilité d'orge {pct}%)"
+    )
+    return {
+        "hybrid_score": pct,
+        "final_is_barley": s2["is_barley"],
+        "final_verdict": verdict,
+        "final_confidence": js_round(max(probability, 1 - probability) * 100),
+    }
+
+
+def _s2_barley_segment(polygon: list[LatLng], s2: dict[str, Any], ndvi_percentage: float | None) -> list[dict[str, Any]]:
+    """La parcelle entière devient contour d'orge si le classifieur Sentinel-2 y conclut."""
+    if not s2["is_barley"]:
+        return []
+    return [
+        {
+            "coordinates": polygon,
+            "confidence": js_round(s2["probability"] * 100),
+            "ndvi": ndvi_percentage / 100 if ndvi_percentage is not None else None,
+            "area_ha": js_round((approximate_polygon_area_m2(polygon) / 10_000) * 100) / 100,
+        }
+    ]
 
 
 # ── Main handler ──
@@ -1251,12 +1230,6 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         if isinstance(rain_result, BaseException):
             warnings.append(f"Précipitations indisponibles : {_error_message(rain_result)}")
 
-        if access_token:
-            detected_segments = await _detect_barley_segments(access_token, project_id, parcel_polygon, effective_zoom, warnings)
-        else:
-            detected_segments = []
-            warnings.append("SNIC non exécuté : authentification GEE indisponible.")
-
         satellite_image: str | None = None
         try:
             satellite_image = await capture_parcel_image(lat, lng, effective_zoom, parcel_polygon)
@@ -1266,10 +1239,45 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         planting = detect_planting_date(time_series["s2"], time_series["s1"])
         agro = compute_agro_score(sat_data, planting, time_series)
         hf_result = await _call_hf_model_safely(satellite_image, warnings) if satellite_image else None
-        hybrid = compute_hybrid_score(hf_result["confidence"], hf_result["is_barley"], agro["score"]) if hf_result else create_agro_only_hybrid_score(agro["score"])
+
+        from app.services.s2_time_series import fetch_s2_monthly_series
+
+        # Verdict prioritaire : RF saisonnier (modèle entraîné hors-ligne, série S2 12 mois).
+        # Replis dans l'ordre : classifieur logistique Sentinel-2 calibré terrain, puis
+        # l'ancienne fusion CNN (modèle HF andritonny, conservé) + score agro.
+        s2_monthly: list[dict[str, Any]] = []
+        rf = None
+        if access_token:
+            try:
+                s2_monthly = await fetch_s2_monthly_series(access_token, project_id, parcel_polygon)
+            except Exception as error:  # noqa: BLE001
+                warnings.append(f"Série Sentinel-2 mensuelle indisponible (RF) : {_error_message(error)}")
+            try:
+                rf = classify_barley_rf(s2_monthly) if s2_monthly else None
+            except Exception as error:  # noqa: BLE001
+                logger.warning("Classifieur RF orge en échec : %s", error)
+                rf = None
+            if s2_monthly and rf is None:
+                warnings.append("Classifieur RF indisponible (modèle absent ou série trop courte).")
+
+        s2 = classify_barley_s2(sat_data)
+        if rf:
+            hybrid = verdict_from_rf(rf)
+            detected_segments = _rf_barley_segment(parcel_polygon, rf, sat_data["ndvi"])
+        elif s2:
+            hybrid = verdict_from_s2(s2)
+            detected_segments = _s2_barley_segment(parcel_polygon, s2, sat_data["ndvi"])
+        else:
+            hybrid = compute_hybrid_score(hf_result["confidence"], hf_result["is_barley"], agro["score"]) if hf_result else create_agro_only_hybrid_score(agro["score"])
+            detected_segments = _parcel_as_barley_segment(parcel_polygon, hf_result, sat_data["ndvi"])
+            warnings.append("Classifieurs Sentinel-2 indisponibles (RF absent ou série trop courte, modèle logistique absent ou valeurs manquantes) : verdict par l'ancienne fusion CNN + agro, peu fiable.")
         season = detect_season(lat)
 
         data_source_parts = ["Contour parcellaire réel", *sat_data["dataSource"]]
+        if rf:
+            data_source_parts.append(RF_CLASSIFIER_SOURCE)
+        elif s2:
+            data_source_parts.append(S2_CLASSIFIER_SOURCE)
         if hf_result:
             data_source_parts.append(f"HF OrgeDetector ({HF_MODEL_URL})")
         data_source = " + ".join(data_source_parts)
@@ -1299,19 +1307,35 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         if sat_data["vhVvRatio"] is not None and sat_data["vhVvRatio"] > 0.45:
             risk_factors.append("Structure radar type forêt")
         if not hybrid["final_is_barley"] and hybrid["final_confidence"] > 70:
-            risk_factors.append("Score hybride confirme non-orge")
+            risk_factors.append("Verdict non-orge avec une confiance élevée")
 
         detail_parts = []
-        detail_parts.append(f"CNN: {'orge' if hf_result['is_barley'] else 'non-orge'} ({hf_result['confidence']:.1f}%)" if hf_result else "CNN: indisponible")
-        detail_parts.append(f"Agro: {agro['score']}%")
-        detail_parts.append(f"Hybride: {hybrid['hybrid_score']}%")
+        if rf:
+            detail_parts.append(f"RF Sentinel-2: orge {js_round(rf['probability'] * 100)}%")
+        if s2:
+            detail_parts.append(f"Sentinel-2: orge {js_round(s2['probability'] * 100)}%")
+        cnn_label = "CNN (indicatif)" if (rf or s2) else "CNN"
+        detail_parts.append(f"{cnn_label}: {'orge' if hf_result['is_barley'] else 'non-orge'} ({hf_result['confidence']:.1f}%)" if hf_result else f"{cnn_label}: indisponible")
+        detail_parts.append(f"Agro{' (indicatif)' if (rf or s2) else ''}: {agro['score']}%")
+        if not (rf or s2):
+            detail_parts.append(f"Hybride: {hybrid['hybrid_score']}%")
 
         soil_type = None
         if sat_data["swir"] is not None and sat_data["nir"] is not None and sat_data["nir"] != 0:
             ratio = sat_data["swir"] / sat_data["nir"]
             soil_type = "Sol argileux sec" if ratio > 1.5 else "Sol limoneux" if ratio > 1.0 else "Sol humide"
 
-        if hf_result:
+        if rf:
+            recommendations = (
+                f"{'Orge' if rf['is_barley'] else 'Non-orge'} selon la dynamique saisonnière Sentinel-2 de la parcelle "
+                f"(probabilité d'orge {js_round(rf['probability'] * 100)}%). {rf_calibration_note()}"
+            )
+        elif s2:
+            recommendations = (
+                f"{'Orge' if s2['is_barley'] else 'Non-orge'} selon les indices Sentinel-2 de la parcelle "
+                f"(probabilité d'orge {js_round(s2['probability'] * 100)}%). {s2_calibration_note(s2)}"
+            )
+        elif hf_result:
             recommendations = (
                 f"Orge {'confirmée' if hybrid['final_confidence'] > 70 else 'probable'}. Score hybride {hybrid['hybrid_score']}% (CNN {js_round(hf_result['confidence'])}% + Agro {agro['score']}%)."
                 if hybrid["final_is_barley"]
@@ -1324,14 +1348,18 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
 
         response = {
             "percentage": sat_data["ndvi"],
-            "is_barley": hf_result["is_barley"] is True if hf_result else False,
+            "is_barley": hybrid["final_is_barley"] if (rf or s2) else (hf_result["is_barley"] is True if hf_result else False),
+            "s2_prob_barley": js_round(s2["probability"] * 1000) / 10 if s2 else None,
+            "rf_prob_barley": js_round(rf["probability"] * 1000) / 10 if rf else None,
+            "rf_threshold": rf["threshold"] if rf else None,
+            "rf_available": rf is not None,
             "detected_segments": detected_segments,
             "hf_model_url": HF_MODEL_URL,
             "hf_available": hf_result is not None,
             "verdict": hybrid["final_verdict"],
             "details": " | ".join(detail_parts),
-            "culture_detected": ("Orge" if hf_result["is_barley"] else "Non-orge") if hf_result else None,
-            "confidence": hf_result["confidence"] if hf_result else None,
+            "culture_detected": ("Orge" if hybrid["final_is_barley"] else "Non-orge") if (rf or s2) else (("Orge" if hf_result["is_barley"] else "Non-orge") if hf_result else None),
+            "confidence": hybrid["final_confidence"] if (rf or s2) else (hf_result["confidence"] if hf_result else None),
             "cnn_prob_barley": hf_result["prob_barley"] if hf_result else None,
             "cnn_prob_non_barley": hf_result["prob_non_barley"] if hf_result else None,
             "cnn_available": hf_result is not None,
@@ -1348,6 +1376,8 @@ async def analyze_parcel(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             "boundary_source": "Contour fourni par l'utilisateur, le cadastre ou une source agricole fiable",
             "recommendations": recommendations,
             "anomaly_level": "AUCUNE" if hybrid["final_is_barley"] else "FORTE",
+            "rf_classified": rf is not None,
+            "s2_monthly_series": s2_monthly,
             "data_source": data_source,
             "warnings": warnings,
             "radar_analysis": radar_analysis,

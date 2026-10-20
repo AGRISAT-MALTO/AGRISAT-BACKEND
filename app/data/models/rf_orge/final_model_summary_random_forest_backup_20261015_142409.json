@@ -1,0 +1,44 @@
+{
+  "best_params": {
+    "n_estimators": 600,
+    "max_depth": 10,
+    "min_samples_leaf": 2,
+    "max_features": "sqrt",
+    "class_weight": "balanced_subsample"
+  },
+  "threshold": 0.408824338150188,
+  "threshold_strategy": {
+    "strategy": "macro_f1",
+    "macro_f1_at_thr": 0.5872431448536184
+  },
+  "final_metrics": {
+    "threshold": 0.408824338150188,
+    "accuracy": 0.6730486008836525,
+    "precision_orge": 0.7078853046594982,
+    "recall_orge": 0.8700440528634361,
+    "precision_non_orge": 0.512396694214876,
+    "recall_non_orge": 0.27555555555555555,
+    "f1_orge": 0.7806324110671937,
+    "tn": 124,
+    "fp": 326,
+    "fn": 118,
+    "tp": 790,
+    "roc_auc": 0.5615100342633382,
+    "pr_auc": 0.6767627740666247
+  },
+  "anti_leakage": {
+    "n_splits": 20,
+    "gid_intersections": 0,
+    "season_intersections": 0,
+    "ok": true
+  },
+  "n_splits": 20,
+  "n_features": 48,
+  "dataset_paths": [
+    "D:\\ASA\\modele_orge\\training\\data\\dataset.csv",
+    "data/antsirabe_extra_2026.csv",
+    "data/STAR_ORGE_Betafo_Sentinel2_TimeSeries_compatible.csv",
+    "data/STAR_ORGE_NON_ORGE_Betafo_2024_2026_compatible.csv"
+  ],
+  "n_rows": 19291
+}

@@ -39,6 +39,7 @@ async def analyze_simple(request: Request) -> JSONResponse:
             "confidenceThreshold": parsed.confidence_threshold,
             "minAreaHa": parsed.min_area_ha,
             "gddConfig": gdd_config,
+            "tracedParcels": [parcel.as_dict() for parcel in parsed.traced_parcels],
         }
     )
 

@@ -19,6 +19,18 @@ class Point(BaseModel):
     lng: float
 
 
+MAX_TRACED_PARCELS = 2_000
+
+
+class TracedParcel(BaseModel):
+    """Parcelle déjà tracée à l'écran (modèle JECAM-VHR), envoyée par le frontend pour être classée."""
+
+    coordinates: list[Point] = Field(min_length=3, max_length=5_000)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"coordinates": [point.model_dump() for point in self.coordinates]}
+
+
 class AnalyzeSimpleRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -28,8 +40,9 @@ class AnalyzeSimpleRequest(BaseModel):
     confidence_threshold: float | None = Field(default=None, ge=0.5, le=0.95, alias="confidenceThreshold")
     min_area_ha: float | None = Field(default=None, ge=0.01, le=5, alias="minAreaHa")
     base_temperature: float | None = Field(default=None, ge=-20, le=30, alias="baseTemperature")
-    threshold: float | None = Field(default=None, ge=2200, le=10_000)
+    threshold: float | None = Field(default=None, ge=2000, le=10_000)
     period_days: int | None = Field(default=None, ge=1, le=730, alias="periodDays")
+    traced_parcels: list[TracedParcel] = Field(default_factory=list, max_length=MAX_TRACED_PARCELS, alias="tracedParcels")
 
     _v_lat = field_validator("latitude", "longitude", "radius")(_finite)
 
@@ -41,8 +54,9 @@ class AutomaticDetectionRequest(BaseModel):
     lng: float = Field(ge=-180, le=180)
     radius_km: float = Field(ge=0.05, le=20, alias="radiusKm")
     base_temperature: float = Field(ge=-20, le=30, alias="baseTemperature")
-    threshold: float = Field(ge=2200, le=10_000)
+    threshold: float = Field(ge=2000, le=10_000)
     period_days: int = Field(ge=1, le=730, alias="periodDays")
+    traced_parcels: list[TracedParcel] = Field(default_factory=list, max_length=MAX_TRACED_PARCELS, alias="tracedParcels")
 
     _v = field_validator("lat", "lng", "radius_km", "base_temperature", "threshold")(_finite)
 
