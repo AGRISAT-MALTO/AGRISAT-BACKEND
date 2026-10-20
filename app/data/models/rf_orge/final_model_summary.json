@@ -1,44 +1,51 @@
 {
+  "model": "LogisticRegression (SimpleImputer + StandardScaler + balanced)",
   "best_params": {
-    "n_estimators": 600,
-    "max_depth": 10,
-    "min_samples_leaf": 2,
-    "max_features": "sqrt",
-    "class_weight": "balanced_subsample"
+    "C": 0.1,
+    "class_weight": "balanced",
+    "max_iter": 5000,
+    "scaler": "StandardScaler"
   },
-  "threshold": 0.408824338150188,
+  "threshold": 0.37888962596890746,
   "threshold_strategy": {
     "strategy": "macro_f1",
-    "macro_f1_at_thr": 0.5872431448536184
+    "macro_f1_at_thr": 0.7224966474851895
   },
   "final_metrics": {
-    "threshold": 0.408824338150188,
-    "accuracy": 0.6730486008836525,
-    "precision_orge": 0.7078853046594982,
-    "recall_orge": 0.8700440528634361,
-    "precision_non_orge": 0.512396694214876,
-    "recall_non_orge": 0.27555555555555555,
-    "f1_orge": 0.7806324110671937,
-    "tn": 124,
-    "fp": 326,
-    "fn": 118,
-    "tp": 790,
-    "roc_auc": 0.5615100342633382,
-    "pr_auc": 0.6767627740666247
+    "threshold": 0.37888962596890746,
+    "accuracy": 0.7254098360655737,
+    "precision_orge": 0.6824324324324325,
+    "recall_orge": 0.8347107438016529,
+    "precision_non_orge": 0.7916666666666666,
+    "recall_non_orge": 0.6178861788617886,
+    "f1_orge": 0.7509293680297398,
+    "tn": 152,
+    "fp": 94,
+    "fn": 40,
+    "tp": 202,
+    "roc_auc": 0.7483538265134717,
+    "pr_auc": 0.6400826753621809
   },
+  "metrics_note": "OOF diagnostics only; not an independent test set.",
   "anti_leakage": {
-    "n_splits": 20,
+    "n_splits": 5,
     "gid_intersections": 0,
     "season_intersections": 0,
     "ok": true
   },
-  "n_splits": 20,
-  "n_features": 48,
+  "n_splits": 5,
+  "n_features": 44,
   "dataset_paths": [
     "D:\\ASA\\modele_orge\\training\\data\\dataset.csv",
-    "data/antsirabe_extra_2026.csv",
-    "data/STAR_ORGE_Betafo_Sentinel2_TimeSeries_compatible.csv",
-    "data/STAR_ORGE_NON_ORGE_Betafo_2024_2026_compatible.csv"
+    "D:\\ASA\\modele_orge\\training\\data\\antsirabe_extra_2026.csv",
+    "D:\\ASA\\modele_orge\\training\\data\\STAR_ORGE_Betafo_Sentinel2_TimeSeries_compatible.csv",
+    "D:\\ASA\\modele_orge\\training\\data\\STAR_ORGE_NON_ORGE_Betafo_2024_2026_compatible.csv",
+    "D:\\ASA\\modele_orge\\training\\data\\antsirabe_annotations_compatible.csv"
   ],
-  "n_rows": 19291
+  "n_rows": 27450,
+  "n_rows_raw": 45243,
+  "n_seasons": 488,
+  "trained_at": "2026-10-15T12:00:04.613690+00:00",
+  "production_model": "logistic_regression",
+  "random_forest_backup": "D:\\ASA\\MALTO\\AGRISAT-BACKEND\\app\\data\\models\\rf_orge\\final_orge_model_random_forest_backup_20261015_142409.pkl"
 }

@@ -1,16 +1,16 @@
-"""Classifieur orge / non-orge par Random Forest sur la série Sentinel-2 annuelle.
+"""Classifieur orge / non-orge sur la série Sentinel-2 annuelle.
 
 Intègre dans MALTO/AGRISAT le modèle entraîné hors-ligne (projet `modele_orge`,
-pipeline sklearn : SimpleImputer median + RandomForestClassifier, sauvegardé dans
-app/data/models/rf_orge/final_orge_model.pkl). Décrit la saison cultural par 48
-caractéristiques spectro-temporelles des 4 indices NDVI / EVI / NDRE / NDMI,
-reproduisant exactement training/src/feature_engineering.py :
+pipeline sklearn sauvegardé dans app/data/models/rf_orge/final_orge_model.pkl).
+Le schéma de features est lu depuis final_feature_names.json. Les modèles RF
+historiques utilisent 48 caractéristiques ; la Logistic Regression standardisée
+utilise les 44 statistiques et fenêtres de campagne du pipeline récent :
 
 - stats robustes de la série : mean, median, std, min, max, amp, q10, q90
 - moyennes par fenêtre saisonnière (hiver doy<=59|>=300, printemps 60-151,
-  été 152-243, automne 244-299)
-- 12 stats par indice = 4 indices × 12 = 48 features (le RF final n'utilise
-  volontairement pas les features dynamiques ni les bandes brutes)
+    été 152-243, automne 244-299) pour les modèles historiques
+- fenêtres de campagne mars-avril, mai-juillet, août-octobre pour la Logistic
+    Regression standardisée
 
 Fiabilité : l'échantillon d'inférence = une saison (parcelle, année glissante)
 sur 12 mois ; un mois nuageux (bandes à None) ne bloque pas la prédiction, les
@@ -56,6 +56,11 @@ _SEASON_WINDOWS: dict[str, Any] = {
 _INDICES = ["NDVI", "EVI", "NDRE", "NDMI"]
 _STATS = ["mean", "median", "std", "min", "max", "amp", "q10", "q90"]
 _SEASONS = ["winter", "spring", "summer", "autumn"]
+_CROP_WINDOWS: dict[str, Any] = {
+    "early_crop": lambda month: (month >= 3) & (month <= 4),
+    "mid_crop": lambda month: (month >= 5) & (month <= 7),
+    "late_crop": lambda month: (month >= 8) & (month <= 10),
+}
 
 
 @lru_cache(maxsize=1)
@@ -107,7 +112,7 @@ def _seasonal_means(dates: pd.Series, values: np.ndarray, prefix: str) -> dict[s
 
 
 def build_features(series: list[dict[str, Any]]) -> pd.DataFrame | None:
-    """Construit le vecteur de 48 features depuis la série mensuelle de s2_time_series.
+    """Construit les features exigées par le modèle chargé.
 
     series : [{date: 'YYYY-MM', NDVI, EVI, NDRE, NDMI, B2..B12}, ...]
     Retourne un DataFrame à 1 ligne (colonnes = noms attendus par le pipeline),
@@ -121,6 +126,17 @@ def build_features(series: list[dict[str, Any]]) -> pd.DataFrame | None:
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame = frame.dropna(subset=["date"]).sort_values("date").drop_duplicates(subset="date")
 
+    model = load_model()
+    if model is None:
+        return None
+    use_crop_features = any(
+        name.endswith("_early_crop_mean") for name in model["features"]
+    )
+    if use_crop_features:
+        frame = frame.loc[frame["date"].dt.month.between(3, 10)].copy()
+        if frame.empty:
+            return None
+
     valid_months = 0
     features: dict[str, float] = {}
     for index in _INDICES:
@@ -128,14 +144,19 @@ def build_features(series: list[dict[str, Any]]) -> pd.DataFrame | None:
         if np.isfinite(values).sum() >= MIN_VALID_MONTHS:
             valid_months += 1
         features.update(_stats_block(values, index))
-        features.update(_seasonal_means(frame["date"], values, index))
+        if use_crop_features:
+            month = frame["date"].dt.month.to_numpy()
+            for season, window in _CROP_WINDOWS.items():
+                mask = window(month) & np.isfinite(values)
+                features[f"{index}_{season}_mean"] = (
+                    float(np.mean(values[mask])) if mask.any() else np.nan
+                )
+        else:
+            features.update(_seasonal_means(frame["date"], values, index))
 
     if valid_months == 0:
         return None
 
-    model = load_model()
-    if model is None:
-        return None
     return pd.DataFrame([features])[model["features"]]
 
 
@@ -154,5 +175,5 @@ def classify(series: list[dict[str, Any]]) -> dict[str, Any] | None:
         "is_barley": probability >= model["threshold"],
         "threshold": model["threshold"],
         "n_features": len(model["features"]),
-        "model_version": MODEL_DIR.name,
+        "model_version": model["summary"].get("production_model", MODEL_DIR.name),
     }
