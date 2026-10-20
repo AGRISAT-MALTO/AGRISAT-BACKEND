@@ -8,8 +8,10 @@ contours Fields of The World (app/services/zone_parcels.py, conserve).
 
 Pourquoi un service separe
 --------------------------
-Le modele exige torch et ultralytics (~2,5 Go). Comme pour le U-Net de
-field_segmentation, il tourne a part et le backend l'appelle en HTTP.
+Le modele exige torch et ultralytics. Contrairement au modele YOLO de
+/api/field-segmentation (desormais embarque et execute dans le backend), le
+tracage VHR reste un service separe : il combine le telechargement des tuiles
+Esri, la mosaique et la fusion de fenetres chevauchantes autour du modele.
 
 Deux modes de tracage
 ---------------------

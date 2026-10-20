@@ -26,23 +26,67 @@ API du projet AGRISAT : détection automatique de parcelles agricoles, analyse d
 | ORM / base de données | [SQLAlchemy](https://www.sqlalchemy.org/) (async) + [Alembic](https://alembic.sqlalchemy.org/) + PostgreSQL (compatible [Neon](https://neon.tech/)) |
 | Validation          | [Pydantic](https://docs.pydantic.dev/)   |
 | Imagerie satellite  | Google Earth Engine (GEE, via `google-auth` + API REST), Sentinel-2, Planet, Airbus OneAtlas |
-| Détection IA        | Modèle de segmentation U-Net (service externe FastAPI/Hugging Face) |
+| Détection IA        | Modèles embarqués exécutés dans le processus : YOLO11-seg (parcelles) et Random Forest (orge) |
 
 ## Architecture
 
 Le backend orchestre plusieurs sources et services externes :
 
 - **Google Earth Engine (GEE)** : indices spectraux (NDVI, NDRE, EVI, SAVI, NDWI), séries temporelles Sentinel-1/2, tuiles Sentinel-2. Accès via l'API REST (`value:compute` / `image:computePixels`), authentifié avec un compte de service via `google-auth`.
-- **Modèle de segmentation de parcelles** (`FIELD_SEGMENTATION_MODEL_URL`) : service externe (ex. `agri_field_segmentation`, FastAPI/U-Net) utilisé pour la délimitation automatique des parcelles et la détection d'orge par CNN.
+- **Modèles embarqués** : le modèle YOLO de segmentation de parcelles (`app/data/models/field_segmentation/`) et le Random Forest orge (`app/data/models/orge_rf/`) sont chargés et exécutés directement par le backend, sans API ni service séparé. La segmentation est préchauffée au démarrage ; le classifieur orge s'appuie sur la série Sentinel-2 mensuelle.
 - **Airbus OneAtlas** : imagerie haute résolution complémentaire.
 - **PostgreSQL (SQLAlchemy)** : persistance des parcelles (`parcelles`) et des exécutions d'analyse (`field_scan_runs`).
+
+### Modèles embarqués
+
+| Modèle | Fichier | Rôle | Dépendances |
+| --- | --- | --- | --- |
+| YOLO11-seg « Delineate JECAM v3 precision » | `app/data/models/field_segmentation/parcel_segmentation_yolo.pt` | Segmente les parcelles d'une image VHR et alimente `/api/field-segmentation` | `torch`, `ultralytics`, `pillow` |
+| Random Forest orge (projet `ASA/Orge`) | `app/data/models/orge_rf/orge_rf.joblib` | Classe l'orge à partir de la série Sentinel-2 mensuelle (48 variables) | `scikit-learn`, `joblib`, `pandas`, `numpy` |
+
+Le modèle orge est une copie statique du projet `ASA/Orge` : après un
+réentraînement, resynchroniser les artefacts (script idempotent, refuse un
+modèle incohérent) :
+
+```bash
+python scripts/sync_orge_model.py --check   # compare les empreintes, code 1 si divergence
+python scripts/sync_orge_model.py           # copie joblib + métriques + seuil
+```
+
+Les deux modèles sont chargés en mémoire une seule fois, au démarrage, et
+exécutés dans le processus FastAPI. Aucun appel HTTP n'est effectué. Le
+chargement initial prend quelques dizaines de secondes (import de PyTorch +
+premier passage du modèle) ; ensuite une image 512 × 512 est segmentée en
+quelques secondes sur CPU.
+
+Pour éviter d'installer les bibliothèques CUDA sur un serveur sans GPU :
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install -e .
+```
+
+Les poids YOLO sont issus de `agri_field_segmentation` et sous licence
+**AGPL-3.0** : vérifier les obligations de cette licence avant toute diffusion
+commerciale du service.
+
+Le seuil de `/api/field-segmentation` est la confiance minimale d'une parcelle
+pour entrer dans le masque. **Défaut : 0,1** (`FIELD_SEGMENTATION_THRESHOLD`),
+qui est la confiance de production du projet source. Ne pas remonter à 0,5 sans
+mesure : les confiances du modèle sont faibles (médiane ~0,2, maximum ~0,6 sur
+les tuiles JECAM), et un seuil à 0,5 ne garde que 1 à 5 parcelles sur 28-155,
+soit 0,4-6 % de l'image au lieu de 19-53 %.
+
+`WARMUP_MODELS=false` saute le préchauffage (chargement + inférence à blanc,
+~20 s) pour un `--reload` immédiat : les modèles se chargent alors à la
+première requête.
 
 ## Prérequis
 
 - [Python](https://www.python.org/) 3.11 ou supérieur
 - Une base PostgreSQL accessible (ex. [Neon](https://neon.tech/))
 - Un compte de service Google Earth Engine (clé JSON)
-- (Optionnel) Un service de segmentation de parcelles compatible (`FIELD_SEGMENTATION_MODEL_URL`)
+- Espace disque pour les poids embarqués (~14 Mo) et, si nécessaire, PyTorch CPU
 - (Optionnel) Des clés API Planet / Airbus OneAtlas si ces sources sont utilisées
 
 ## Installation
@@ -73,7 +117,7 @@ cp .env.example .env
 | `DATABASE_URL`                     |   **Oui**   | URL de connexion PostgreSQL, ex. Neon : `postgresql://user:password@host/db?sslmode=require`       |
 | `GEE_SERVICE_ACCOUNT_KEY`          |   **Oui**   | Clé JSON du compte de service Google Earth Engine (indices spectraux, tuiles Sentinel-2)                     |
 | `HF_MODEL_URL`                     |     Non     | URL du modèle hébergé (Hugging Face Space) utilisé en complément de la détection                            |
-| `FIELD_SEGMENTATION_MODEL_URL`     |     Non     | URL du service de segmentation U-Net (`/predict`, `/segment`). En local : `http://localhost:8000`             |
+| `FIELD_SEGMENTATION_MODEL_PATH`    |     Non     | Chemin des poids YOLO de segmentation. Vide : `app/data/models/field_segmentation/parcel_segmentation_yolo.pt` |
 | `VHR_MODEL_URL`                    |     Non     | URL du service de traçage automatique des parcelles (`serve_vhr.py`). En local : `http://localhost:8010`      |
 | `VHR_SERVICE_DIR`                  |     Non     | Dossier du projet `agri_field_segmentation` : le backend lance alors tout seul le service de traçage au démarrage (si `/health` ne répond pas). Vide : démarrage manuel |
 | `VHR_SERVICE_PYTHON`               |     Non     | Python utilisé pour l'auto-start (défaut : venv du service s'il existe, sinon le Python du backend)           |
@@ -143,7 +187,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 3001
 | `POST`    | `/api/analyze`                        | Analyse simplifiée d'une zone (rayon, seuils de confiance/surface)       |
 | `GET`     | `/api/analyze/latest`                 | Dernière analyse enregistrée pour une position donnée                    |
 | `GET`     | `/api/sentinel-tiles/:z/:x/:y`        | Tuile Sentinel-2 (PNG) pour un timestamp d'image donné                   |
-| `POST`    | `/api/field-segmentation`             | Segmentation d'une image de parcelle via le modèle U-Net externe          |
+| `POST`    | `/api/field-segmentation`             | Segmentation d'une image de parcelle par le modèle YOLO embarqué          |
 
 Toutes les routes retournent du JSON et valident leur entrée avec [Pydantic](https://docs.pydantic.dev/) (erreurs `400` avec détails en cas d'échec de validation).
 
@@ -176,5 +220,5 @@ AGRISAT-BACKEND/
 | Erreurs `CORS` côté frontend                                | `FRONTEND_ORIGIN` ne correspond pas à l'origine réelle du frontend                                |
 | Erreurs liées à Google Earth Engine                          | `GEE_SERVICE_ACCOUNT_KEY` manquante/invalide, ou compte de service sans accès au projet GEE       |
 | `/api/planet/*` renvoie une erreur 500                       | `PLANET_API_KEY` absente du fichier `.env`                                                        |
-| `/api/field-segmentation` renvoie 502                        | Le service `FIELD_SEGMENTATION_MODEL_URL` n'est pas démarré ou n'est pas accessible                |
+| `/api/field-segmentation` renvoie 502                        | Poids YOLO absents ou illisibles, ou `torch`/`ultralytics` non installés (voir les logs du lifespan) |
 | `/api/parcelles` renvoie 503                                 | La base de données (`DATABASE_URL`) est inaccessible ou la requête a dépassé le délai imparti      |

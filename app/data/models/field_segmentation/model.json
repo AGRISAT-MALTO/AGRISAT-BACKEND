@@ -1,0 +1,18 @@
+{
+  "name": "parcel_segmentation_yolo",
+  "task": "segment",
+  "classes": {
+    "0": "field"
+  },
+  "weights": "parcel_segmentation_yolo.pt",
+  "source_project": "agri_field_segmentation",
+  "source_weights": "data/vhr/weights/delineate_jecam_v3_precision.pt",
+  "architecture": "YOLO11 instance segmentation (Delineate Anything, affiné JECAM)",
+  "license": "AGPL-3.0",
+  "inference": {
+    "imgsz": 768,
+    "detection_confidence": 0.1,
+    "mask_threshold": 0.5
+  },
+  "notes": "Poids embarqués dans le backend : aucune API ni service séparé. Vérifier les obligations AGPL-3.0 avant diffusion commerciale."
+}

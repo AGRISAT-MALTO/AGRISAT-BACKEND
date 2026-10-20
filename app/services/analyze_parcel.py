@@ -6,8 +6,9 @@ zoning.py et app/routes/sentinel_tiles.py (mêmes primitives : auth, gee_call/
 gee_constant, add_spectral_index, capture d'images, fetch_with_retry).
 
 Verdict orge / non-orge, par ordre de priorité :
-1. Classifieur RF saisonnier (barley_rf_classifier.py, modèle entraîné hors-ligne
-   sur 12 mois de série Sentinel-2) ;
+1. Classifieur RF orge (barley_rf_classifier.py, modèle du projet ASA/Orge :
+   48 variables spectrales-temporelles sur 12 mois de série Sentinel-2,
+   probabilité moyenne au niveau parcelle) ;
 2. Classifieur Sentinel-2 calibré sur le terrain (barley_s2_classifier.py) ;
 3. Repli : ancienne fusion CNN (modèle HF andritonny, conservé) + score agro.
 Le CNN et le score agro restent calculés à titre indicatif dans tous les cas.
@@ -1069,7 +1070,7 @@ def _parcel_as_barley_segment(polygon: list[LatLng], hf_result: dict[str, Any] |
 
 # ── Verdict par le classifieur RF saisonnier (app/services/barley_rf_classifier.py) ──
 
-RF_CLASSIFIER_SOURCE = "Classifieur orge RF (série Sentinel-2 annuelle)"
+RF_CLASSIFIER_SOURCE = "Classifieur orge RF (série Sentinel-2, 48 variables)"
 
 
 def rf_calibration_note() -> str:
@@ -1087,7 +1088,7 @@ def rf_calibration_note() -> str:
         parts.append(f"AUC {auc:.2f}")
     detail = ", ".join(parts)
     return (
-        f"Random Forest sur la dynamique saisonnière Sentinel-2 (12 mois, 48 caractéristiques"
+        f"Random Forest orge sur la série Sentinel-2 (48 caractéristiques, décision au niveau parcelle"
         f"{', ' + detail if detail else ''}) : à confirmer sur le terrain hors des zones d'entraînement."
     )
 
@@ -1097,11 +1098,13 @@ def verdict_from_rf(rf: dict[str, Any]) -> dict[str, Any]:
     hybrid_score porte la probabilité d'orge du RF saisonnier."""
     probability = rf["probability"]
     pct = js_round(probability * 100)
-    verdict = (
-        f"✅ ORGE CONFIRMÉE — RF Sentinel-2 (probabilité d'orge {pct}%)"
-        if rf["is_barley"]
-        else f"❌ NON-ORGE — RF Sentinel-2 (probabilité d'orge {pct}%)"
-    )
+    level = rf.get("verdict")
+    if not rf["is_barley"]:
+        verdict = f"❌ NON-ORGE — RF Orge (probabilité d'orge {pct}%)"
+    elif level == "ORGE":
+        verdict = f"✅ ORGE CONFIRMÉE — RF Orge (probabilité d'orge {pct}%)"
+    else:
+        verdict = f"⚠️ ORGE À VÉRIFIER — RF Orge (probabilité d'orge {pct}%)"
     return {
         "hybrid_score": pct,
         "final_is_barley": rf["is_barley"],

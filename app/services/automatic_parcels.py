@@ -3,7 +3,7 @@ point, et calcul des degrés-jours de croissance (GDD, Open-Meteo).
 
 Candidats analysés : en priorité les parcelles déjà tracées à l'écran (modèle JECAM-VHR),
 envoyées par le frontend et classées entières (orge ou non). À défaut, cascade OSM
-Overpass + base -> modèle U-Net -> watershed GEE -> cellules satellite.
+Overpass + base -> watershed GEE -> cellules satellite.
 
 Fidélité : le clipping Sutherland-Hodgman (clip_polygon_to_radius), la compacité de
 Polsby-Popper (is_plausible_field_shape), et toute la géométrie locale (offset_point,
@@ -13,7 +13,6 @@ qui déterminent la forme finale des parcelles renvoyées."""
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import math
 import time
@@ -40,13 +39,11 @@ from app.services.analyze_parcel import (
     get_gee_access_token,
     get_gee_project_id,
     js_round,
-    map_with_concurrency,
     normalize_polygon,
     segment_zoom_for_area,
 )
 from app.services.field_watershed import (
     lng_lat_to_mercator_meters,
-    load_npy_all_bands,
     load_npy_band,
     mercator_meters_to_lng_lat,
     simplify_polygon,
@@ -84,24 +81,7 @@ async def _with_timeout(coro: Awaitable[Any], timeout_s: float, label: str) -> A
         raise RuntimeError(f"{label} : dépassement de {int(timeout_s * 1000)}ms") from exc
 
 
-# ── Segmentation par modèle de segmentation de parcelles (U-Net, agri_field_segmentation) ──
-
-FIELD_SEGMENTATION_MODEL_URL = settings.field_segmentation_model_url
-FIELD_MODEL_TILE_PX = 256
-FIELD_MODEL_SCALE_M = 10
-FIELD_MODEL_REGION_RADIUS_KM = 2
-MAX_FIELD_MODEL_RADIUS_KM = 1.2
-FIELD_MODEL_MONTHS = ["03", "04", "05", "06", "07", "08"]
-FIELD_MODEL_CLOUD_LIMIT = 15
-FIELD_MODEL_GEE_CONCURRENCY = 3
-FIELD_MODEL_MIN_SEGMENT_AREA_M2 = 1_500
-FIELD_MODEL_MAX_SEGMENT_AREA_M2 = 600_000
-FIELD_MODEL_REQUEST_TIMEOUT_S = 30.0
-
-
-def _field_model_season_year() -> int:
-    now = datetime.now(timezone.utc)
-    return now.year if now.month >= 9 else now.year - 1
+# ── Grille de lecture GEE partagée par la segmentation watershed ──
 
 
 def _circle_region_coordinates(lat: float, lng: float, radius_km: float, vertices: int = 48) -> list[list[list[float]]]:
@@ -118,156 +98,8 @@ def _circle_region_coordinates(lat: float, lng: float, radius_km: float, vertice
     return [ring]
 
 
-def _build_monthly_bands_expression(lat: float, lng: float, year: int, month: str) -> dict:
-    start_date = f"{year}-{month}-01"
-    month_int = int(month)
-    if month_int == 12:
-        end_date = f"{year + 1}-01-01"
-    else:
-        end_date = f"{year}-{month_int + 1:02d}-01"
-    values: dict[str, GeeValue] = {}
-
-    def reference(name: str) -> GeeValue:
-        return {"valueReference": name}
-
-    values["region"] = gee_call("GeometryConstructors.Polygon", {"coordinates": gee_constant(_circle_region_coordinates(lat, lng, FIELD_MODEL_REGION_RADIUS_KM))})
-    values["intersectsRegion"] = gee_call("Filter.intersects", {"leftField": gee_constant(".all"), "rightValue": gee_call("Feature", {"geometry": reference("region")})})
-    values["dateRange"] = gee_call("Filter.dateRangeContains", {"leftValue": gee_call("DateRange", {"start": gee_constant(start_date), "end": gee_constant(end_date)}), "rightField": gee_constant("system:time_start")})
-    values["lowCloud"] = gee_call("Filter.lessThan", {"leftField": gee_constant("CLOUDY_PIXEL_PERCENTAGE"), "rightValue": gee_constant(FIELD_MODEL_CLOUD_LIMIT)})
-    values["byRegion"] = gee_call("Collection.filter", {"collection": gee_call("ImageCollection.load", {"id": gee_constant("COPERNICUS/S2_SR_HARMONIZED")}), "filter": reference("intersectsRegion")})
-    values["byDate"] = gee_call("Collection.filter", {"collection": reference("byRegion"), "filter": reference("dateRange")})
-    values["collection"] = gee_call("Collection.filter", {"collection": reference("byDate"), "filter": reference("lowCloud")})
-    values["composite"] = gee_call("reduce.median", {"collection": reference("collection")})
-    values["spectral"] = gee_call("Image.select", {"input": reference("composite"), "bandSelectors": gee_constant(["B2", "B3", "B4", "B8"])})
-    values["withNdvi"] = add_spectral_index(reference("spectral"), "NDVI", ("B8", "B4"))
-    values["finalImage"] = gee_call("Image.unmask", {"input": reference("withNdvi"), "value": gee_image_constant(0)})
-
-    return {"result": "finalImage", "values": values}
-
-
 class _Grid(dict):
     """widthPx, heightPx, originXMeters, originYMeters, scaleMeters."""
-
-
-async def _call_gee_compute_pixels_multi_band(access_token: str, project_id: str, expression: dict, band_ids: list[str], grid: _Grid) -> tuple[dict[str, np.ndarray], int, int]:
-    url = f"https://earthengine.googleapis.com/v1/projects/{project_id}/image:computePixels"
-    body = {
-        "expression": expression,
-        "fileFormat": "NPY",
-        "bandIds": band_ids,
-        "grid": {
-            "dimensions": {"width": grid["widthPx"], "height": grid["heightPx"]},
-            "affineTransform": {
-                "scaleX": grid["scaleMeters"], "shearX": 0, "translateX": grid["originXMeters"],
-                "shearY": 0, "scaleY": -grid["scaleMeters"], "translateY": grid["originYMeters"],
-            },
-            "crsCode": "EPSG:3857",
-        },
-    }
-    response = await fetch_with_retry("POST", url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, json=body, timeout_s=GEE_COMPUTE_TIMEOUT_S)
-    if response.status_code >= 400:
-        raise RuntimeError(f"GEE computePixels ({','.join(band_ids)}) : erreur {response.status_code} {response.text[:300]}")
-    bands, width, height = load_npy_all_bands(response.content)
-    return bands, width, height
-
-
-async def _fetch_field_model_input_array(access_token: str, project_id: str, lat: float, lng: float) -> tuple[np.ndarray, _Grid]:
-    year = _field_model_season_year()
-    center_x, center_y = lng_lat_to_mercator_meters(lng, lat)
-    half_size_meters = (FIELD_MODEL_TILE_PX * FIELD_MODEL_SCALE_M) / 2
-    grid = _Grid(
-        widthPx=FIELD_MODEL_TILE_PX, heightPx=FIELD_MODEL_TILE_PX,
-        originXMeters=center_x - half_size_meters, originYMeters=center_y + half_size_meters,
-        scaleMeters=FIELD_MODEL_SCALE_M,
-    )
-
-    band_names = ["B2", "B3", "B4", "B8", "NDVI"]
-    month_tasks = list(enumerate(FIELD_MODEL_MONTHS))
-
-    async def month_mapper(item: tuple[int, str]) -> tuple[int, dict[str, np.ndarray]]:
-        month_index, month = item
-        expression = _build_monthly_bands_expression(lat, lng, year, month)
-        bands, _w, _h = await _call_gee_compute_pixels_multi_band(access_token, project_id, expression, band_names, grid)
-        return month_index, bands
-
-    monthly_results = await map_with_concurrency(month_tasks, FIELD_MODEL_GEE_CONCURRENCY, month_mapper)
-
-    tile_size = FIELD_MODEL_TILE_PX * FIELD_MODEL_TILE_PX
-    array = np.zeros(len(band_names) * len(FIELD_MODEL_MONTHS) * tile_size, dtype=np.float32)
-    for month_index, bands in monthly_results:
-        for band_index, band_name in enumerate(band_names):
-            channel_index = band_index * len(FIELD_MODEL_MONTHS) + month_index
-            array[channel_index * tile_size : (channel_index + 1) * tile_size] = bands[band_name]
-
-    return array, grid
-
-
-async def _call_field_boundary_model(raw_array: np.ndarray) -> dict[str, Any]:
-    """Contrat : POST multipart "file" -> tableau .npy (30,256,256) brut, réponse
-    {polygons:[{points:[{x,y},...], score}], image_width, image_height} en coordonnées
-    pixels (origine haut-gauche) — voir agri_field_segmentation/api.py::segment_endpoint."""
-    shape = (5 * len(FIELD_MODEL_MONTHS), FIELD_MODEL_TILE_PX, FIELD_MODEL_TILE_PX)
-    buf = io.BytesIO()
-    np.save(buf, raw_array.reshape(shape).astype("<f4"))
-    npy_bytes = buf.getvalue()
-
-    response = await fetch_with_retry(
-        "POST", f"{FIELD_SEGMENTATION_MODEL_URL}/segment", files={"file": ("field-input.npy", npy_bytes)}, timeout_s=FIELD_MODEL_REQUEST_TIMEOUT_S
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"Modèle de segmentation de parcelles : erreur {response.status_code} {response.text[:300]}")
-    data = response.json()
-    if not isinstance(data, dict) or not isinstance(data.get("polygons"), list):
-        raise RuntimeError("Réponse du modèle de segmentation de parcelles invalide (champ 'polygons' manquant).")
-    return data
-
-
-async def _discover_agricultural_parcels_from_field_model(lat: float, lng: float, radius_km: float) -> list[dict[str, Any]]:
-    if not FIELD_SEGMENTATION_MODEL_URL:
-        return []
-    if radius_km > MAX_FIELD_MODEL_RADIUS_KM:
-        return []
-
-    service_account_json = settings.gee_service_account_key
-    if not service_account_json or service_account_json.startswith("VOTRE_"):
-        return []
-
-    access_token = await get_gee_access_token()
-    project_id = get_gee_project_id()
-    array, grid = await _fetch_field_model_input_array(access_token, project_id, lat, lng)
-    result = await _call_field_boundary_model(array)
-
-    candidates: list[dict[str, Any]] = []
-    index = 0
-    for polygon in result["polygons"]:
-        points = polygon.get("points") if isinstance(polygon, dict) else None
-        if not isinstance(points, list) or len(points) < 3:
-            continue
-
-        coordinates = []
-        for point in points:
-            x_meters = grid["originXMeters"] + point["x"] * grid["scaleMeters"]
-            y_meters = grid["originYMeters"] - point["y"] * grid["scaleMeters"]
-            point_lng, point_lat = mercator_meters_to_lng_lat(x_meters, y_meters)
-            coordinates.append({"lat": point_lat, "lng": point_lng})
-
-        area_m2 = approximate_polygon_area_m2(coordinates)
-        if area_m2 < FIELD_MODEL_MIN_SEGMENT_AREA_M2 or area_m2 > FIELD_MODEL_MAX_SEGMENT_AREA_M2:
-            continue
-        if not _is_plausible_field_shape(coordinates, area_m2):
-            continue
-
-        index += 1
-        candidates.append(
-            {
-                "id": f"field-model-{lat:.6f}-{lng:.6f}-{index}",
-                "coordinates": coordinates,
-                "center": _polygon_center(coordinates),
-                "tags": {"source": "field-boundary-model"},
-            }
-        )
-
-    return candidates
 
 
 # ── Segmentation par watershed marqué + variance NDVI multi-temporelle (sans ML) ──
@@ -896,15 +728,9 @@ async def _discover_agricultural_parcels(lat: float, lng: float, radius_km: floa
 
     traced_candidates: list[dict[str, Any]] = []
     try:
-        traced_candidates = await _discover_agricultural_parcels_from_field_model(lat, lng, radius_km)
+        traced_candidates = await _discover_agricultural_parcels_from_watershed(lat, lng, radius_km)
     except Exception as error:  # noqa: BLE001
-        logger.warning("discoverAgriculturalParcelsFromFieldModel failed, trying next fallback: %s", error)
-
-    if not traced_candidates:
-        try:
-            traced_candidates = await _discover_agricultural_parcels_from_watershed(lat, lng, radius_km)
-        except Exception as error:  # noqa: BLE001
-            logger.warning("discoverAgriculturalParcelsFromWatershed failed, trying next fallback: %s", error)
+        logger.warning("discoverAgriculturalParcelsFromWatershed failed, trying next fallback: %s", error)
 
     merged_candidates = _deduplicate_by_center(known_candidates + traced_candidates)
     return _ensure_coordinate_coverage(merged_candidates, lat, lng, radius_km)
@@ -1127,11 +953,9 @@ async def detect_automatic_parcels(request: dict[str, Any]) -> dict[str, Any]:
         candidates = traced_candidates or await _discover_agricultural_parcels(lat, lng, radius_km)
         config = {"baseTemperature": base_temperature, "threshold": threshold, "periodDays": period_days}
         analyzed_candidates = candidates[:MAX_CANDIDATES]
-        field_model_fallback = any(c["tags"].get("source") == "field-boundary-model" for c in analyzed_candidates)
-        watershed_fallback = not field_model_fallback and any(c["tags"].get("source") == "gee-watershed-segmentation" for c in analyzed_candidates)
+        watershed_fallback = any(c["tags"].get("source") == "gee-watershed-segmentation" for c in analyzed_candidates)
         satellite_window_fallback = (
-            not field_model_fallback
-            and not watershed_fallback
+            not watershed_fallback
             and any((c["tags"].get("source") or "").startswith("satellite-search") for c in analyzed_candidates)
         )
 
@@ -1159,8 +983,6 @@ async def detect_automatic_parcels(request: dict[str, Any]) -> dict[str, Any]:
             notice = f"{len(traced_candidates)} parcelle(s) déjà tracée(s) (JECAM-VHR) dans le rayon, classée(s) entière(s) : orge ou non."
             if len(traced_candidates) > MAX_CANDIDATES:
                 notice += f" Seules les {MAX_CANDIDATES} plus proches du point sont analysées."
-        elif field_model_fallback:
-            notice = "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par le modèle de segmentation U-Net (IA, entraîné sur AI4Boundaries)."
         elif watershed_fallback:
             notice = "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par watershed + analyse NDVI multi-temporelle (Google Earth Engine, sans modèle IA)."
         elif satellite_window_fallback:

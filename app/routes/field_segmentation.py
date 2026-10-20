@@ -35,8 +35,11 @@ async def field_segmentation(request: Request) -> JSONResponse:
         return JSONResponse(status_code=400, content={"error": "fileBase64 invalide (attendu : encodage base64)."})
 
     try:
-        result = await call_field_segmentation_model(file_bytes, parsed.filename, parsed.threshold if parsed.threshold is not None else 0.5)
+        result = await call_field_segmentation_model(file_bytes, parsed.filename, parsed.threshold)
         return JSONResponse(content=result)
+    except ValueError as error:
+        logger.info("field-segmentation: image invalide: %s", error)
+        return JSONResponse(status_code=400, content={"error": str(error) or "Image invalide."})
     except Exception as error:  # noqa: BLE001
         logger.warning("field-segmentation: modèle indisponible: %s", error)
         message = str(error) or "Modèle de segmentation indisponible."
